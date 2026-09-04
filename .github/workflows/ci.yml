@@ -191,3 +191,16 @@ jobs:
         if: always()
         shell: bash
         run: sccache --show-stats || true
+
+  ci-gate:
+    name: CI gate
+    needs: [prepare, icon-audit, windows-rdp-probe, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any CI job failed
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] || [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "::error::One or more CI jobs failed"
+            exit 1
+          fi
