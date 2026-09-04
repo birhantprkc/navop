@@ -173,7 +173,9 @@ impl ConnectionType {
             ConnectionType::SshSftp => IconName::TerminalColor,
             ConnectionType::Redis => IconName::Redis,
             ConnectionType::MongoDB => IconName::MongoDB,
-            ConnectionType::Mqtt => IconName::Mqtt,
+            // 外部 gpui-component 未提供 MQTT 品牌图标,
+            // 核心层回退通用网络图标;品牌图标经应用 AssetSource 提供
+            ConnectionType::Mqtt => IconName::Network,
             ConnectionType::Serial => IconName::SerialPort,
             ConnectionType::Telnet => IconName::SquareTerminalColor,
             ConnectionType::PortForwarding => IconName::PortForwardingColor,
@@ -183,6 +185,16 @@ impl ConnectionType {
         }
     }
 }
+
+/// Navop 自带品牌图标的资源路径。
+///
+/// 外部 gpui-component 的 `IconName` 由其资产宏生成,无法在本仓库扩展变体;
+/// TDengine/MQTT 品牌图标以 SVG 形式内嵌于应用(main 的 `AppAssets`),
+/// 通过 `Icon::default().path(...)` 按路径引用。
+pub const NAVOP_TDENGINE_COLOR_ICON: &str = "navop/tdengine-color.svg";
+pub const NAVOP_TDENGINE_LINE_COLOR_ICON: &str = "navop/tdengine-line-color.svg";
+pub const NAVOP_MQTT_COLOR_ICON: &str = "navop/mqtt-color.svg";
+pub const NAVOP_MQTT_LINE_ICON: &str = "navop/mqtt-line.svg";
 
 /// Database type enumeration
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -295,7 +307,10 @@ impl DatabaseType {
             DatabaseType::MSSQL => IconName::MSSQLColor.color().with_size(Large),
             DatabaseType::Oracle => IconName::OracleColor.color().with_size(Large),
             DatabaseType::ClickHouse => IconName::ClickHouseColor.color().with_size(Large),
-            DatabaseType::TDengine => IconName::TDengineColor.color().with_size(Large),
+            DatabaseType::TDengine => Icon::default()
+                .path(NAVOP_TDENGINE_COLOR_ICON)
+                .color()
+                .with_size(Large),
             DatabaseType::External { .. } => IconName::Database.color().with_size(Large),
         }
     }
@@ -308,7 +323,10 @@ impl DatabaseType {
             DatabaseType::MSSQL => IconName::MSSQLLineColor.color().with_size(Large),
             DatabaseType::Oracle => IconName::OracleLineColor.color().with_size(Large),
             DatabaseType::ClickHouse => IconName::ClickHouseLineColor.color().with_size(Large),
-            DatabaseType::TDengine => IconName::TDengineLineColor.color().with_size(Large),
+            DatabaseType::TDengine => Icon::default()
+                .path(NAVOP_TDENGINE_LINE_COLOR_ICON)
+                .color()
+                .with_size(Large),
             DatabaseType::External { .. } => IconName::Database.color().with_size(Large),
         }
     }

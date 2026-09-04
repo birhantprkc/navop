@@ -12,7 +12,7 @@ use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, Window, div, px,
 };
-use gpui_component::{ActiveTheme, BrandIcon, Icon, IconName, IconSize, Sizable, h_flex};
+use gpui_component::{ActiveTheme, Icon, IconName, IconSize, Sizable, h_flex};
 use one_core::gpui_tokio::Tokio;
 use one_core::storage::{ActiveConnections, StoredConnection, Workspace};
 use one_core::tab_container::{TabContainer, TabContent, TabContentEvent, TabItem};
@@ -201,9 +201,10 @@ impl TabContent for MqttTabView {
             )
         } else {
             Some(
-                BrandIcon::new(IconName::Mqtt)
-                    .with_size(IconSize::Medium)
-                    .into_icon(),
+                Icon::default()
+                    .path(one_core::storage::NAVOP_MQTT_COLOR_ICON)
+                    .color()
+                    .with_size(IconSize::Medium),
             )
         }
     }

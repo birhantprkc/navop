@@ -17,11 +17,10 @@ use gpui::{
     UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, IconSize, Sizable, Size, WindowExt,
-    button::{Button, ButtonVariants as _, IconButton},
-    content_state::ContentState,
+    ActiveTheme, Disableable, Icon, IconName, Sizable, Size, WindowExt,
+    button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Textarea, TextareaState},
     notification::Notification,
     scroll::ScrollableElement,
     select::{Select, SelectItem, SelectState},
@@ -32,6 +31,7 @@ use mqtt_runtime::{MqttMessage, MqttQos, MqttSubscription};
 use one_core::gpui_tokio::Tokio;
 use one_core::storage::StoredConnection;
 use one_core::tab_container::{TabContent, TabContentEvent};
+use one_ui::{ContentState, IconButton};
 use rust_i18n::t;
 use tracing::warn;
 
@@ -108,7 +108,7 @@ pub struct MqttSubscribeView {
     subscribe_qos: Entity<SelectState<Vec<QosSelectItem>>>,
     // 发布输入
     publish_topic_input: Entity<InputState>,
-    publish_payload_input: Entity<InputState>,
+    publish_payload_input: Entity<TextareaState>,
     publish_qos: Entity<SelectState<Vec<QosSelectItem>>>,
     publish_retain: bool,
     /// 消息列表滚动句柄
@@ -128,7 +128,7 @@ impl MqttSubscribeView {
             InputState::new(window, cx).placeholder(t!("MqttSub.publish_topic_placeholder"))
         });
         let publish_payload_input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .placeholder(t!("MqttSub.publish_payload_placeholder"))
                 .auto_grow(2, 6)
         });
@@ -540,7 +540,7 @@ impl MqttSubscribeView {
                                     Icon::new(IconName::Remove),
                                 )
                                 .hit_size(Size::XSmall)
-                                .glyph_size(IconSize::Small)
+                                .glyph_size(one_ui::IconSize::Small)
                                 .tooltip(t!("MqttSub.remove_subscription").to_string())
                                 .on_click(move |_, _, cx| {
                                     view.update(cx, |view, cx| {
@@ -780,7 +780,7 @@ impl MqttSubscribeView {
                             })),
                     ),
             )
-            .child(Input::new(&self.publish_payload_input))
+            .child(Textarea::new(&self.publish_payload_input))
     }
 }
 

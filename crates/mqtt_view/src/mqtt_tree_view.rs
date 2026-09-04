@@ -15,13 +15,13 @@ use gpui::{
     Styled, UniformListScrollHandle, Window, div, prelude::FluentBuilder, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IconName, IconSize, Sizable, Size, WindowExt, button::IconButton,
-    content_state::ContentState, h_flex, notification::Notification, scroll::ScrollableElement,
-    spinner::Spinner, v_flex,
+    ActiveTheme, Icon, IconName, IconSize, Sizable, Size, WindowExt, h_flex,
+    notification::Notification, scroll::ScrollableElement, spinner::Spinner, v_flex,
 };
 use mqtt_runtime::{MqttQos, MqttSubscription};
 use one_core::gpui_tokio::Tokio;
 use one_core::storage::{ActiveConnections, StoredConnection};
+use one_ui::{ContentState, IconButton};
 use rust_i18n::t;
 use tracing::{error, warn};
 
@@ -599,7 +599,7 @@ impl MqttTreeView {
             .child(
                 IconButton::new("mqtt-tree-refresh", Icon::new(IconName::Refresh))
                     .hit_size(Size::XSmall)
-                    .glyph_size(IconSize::Small)
+                    .glyph_size(one_ui::IconSize::Small)
                     .tooltip(t!("Common.refresh").to_string())
                     .on_click(move |_, _, cx| {
                         view.update(cx, |view, cx| {
@@ -709,7 +709,7 @@ impl MqttTreeView {
                                 Icon::new(IconName::Remove),
                             )
                             .hit_size(Size::XSmall)
-                            .glyph_size(IconSize::Small)
+                            .glyph_size(one_ui::IconSize::Small)
                             .tooltip(t!("MqttSub.remove_subscription").to_string())
                             .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
@@ -800,7 +800,8 @@ impl MqttTreeView {
             )
             // 连接图标
             .child(
-                Icon::new(IconName::Mqtt)
+                Icon::default()
+                    .path(one_core::storage::NAVOP_MQTT_COLOR_ICON)
                     .with_size(IconSize::Medium)
                     .when(!is_connected && error_msg.is_none(), |icon| {
                         icon.text_color(cx.theme().muted_foreground)
@@ -841,7 +842,7 @@ impl MqttTreeView {
                         Icon::new(IconName::TriangleAlert),
                     )
                     .hit_size(Size::XSmall)
-                    .glyph_size(IconSize::Small)
+                    .glyph_size(one_ui::IconSize::Small)
                     .text_color(cx.theme().warning)
                     .tooltip(message),
                 )
@@ -851,7 +852,7 @@ impl MqttTreeView {
                         Icon::new(IconName::Refresh),
                     )
                     .hit_size(Size::XSmall)
-                    .glyph_size(IconSize::Small)
+                    .glyph_size(one_ui::IconSize::Small)
                     .tooltip(t!("MqttTree.retry").to_string())
                     .on_click(move |_, _, cx| {
                         view_for_retry.update(cx, |view, cx| {
@@ -874,7 +875,7 @@ impl MqttTreeView {
                                 Icon::new(IconName::Refresh),
                             )
                             .hit_size(Size::XSmall)
-                            .glyph_size(IconSize::Small)
+                            .glyph_size(one_ui::IconSize::Small)
                             .tooltip(t!("MqttTree.refresh_subscriptions").to_string())
                             .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
@@ -889,7 +890,7 @@ impl MqttTreeView {
                                 Icon::new(IconName::Close),
                             )
                             .hit_size(Size::XSmall)
-                            .glyph_size(IconSize::Small)
+                            .glyph_size(one_ui::IconSize::Small)
                             .tooltip(t!("MqttTree.disconnect").to_string())
                             .on_click(move |_, window, cx| {
                                 cx.stop_propagation();
@@ -928,7 +929,12 @@ impl Render for MqttTreeView {
                     .when(entry_count == 0, |this| {
                         this.child(
                             ContentState::empty(t!("MqttTree.no_connections").to_string())
-                                .icon(Icon::new(IconName::Mqtt).color().with_size(IconSize::Large))
+                                .icon(
+                                    Icon::default()
+                                        .path(one_core::storage::NAVOP_MQTT_COLOR_ICON)
+                                        .color()
+                                        .with_size(IconSize::Large),
+                                )
                                 .compact(),
                         )
                     })

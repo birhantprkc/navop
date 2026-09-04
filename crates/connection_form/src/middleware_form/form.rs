@@ -20,7 +20,7 @@ use gpui_component::{
     checkbox::Checkbox,
     form::{Field, field, v_form},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Textarea, TextareaState},
     radio::Radio,
     scroll::ScrollableElement,
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
@@ -210,6 +210,7 @@ pub struct MiddlewareConnectionForm {
     field_values: Vec<(String, Entity<String>)>,
     field_inputs: Vec<Option<Entity<InputState>>>,
     field_selects: HashMap<String, Entity<SelectState<Vec<FormSelectItem>>>>,
+    field_textareas: HashMap<String, Entity<TextareaState>>,
     credential_picker: Entity<CredentialReferencePicker>,
     is_testing: Entity<bool>,
     test_result: Entity<Option<Result<bool, String>>>,
@@ -239,6 +240,7 @@ impl MiddlewareConnectionForm {
         let mut field_values = Vec::new();
         let mut field_inputs = Vec::new();
         let mut field_selects = HashMap::new();
+        let mut field_textareas = HashMap::new();
 
         for tab_group in &config.tab_groups {
             for field in &tab_group.fields {
@@ -283,6 +285,35 @@ impl MiddlewareConnectionForm {
                     field_inputs.push(None);
                 } else if field.field_type == FormFieldType::Checkbox {
                     field_inputs.push(None);
+                } else if field.field_type == FormFieldType::TextArea {
+                    // 新版输入栈将多行文本拆分为独立的 TextareaState
+                    let placeholder = field.placeholder.clone();
+                    let default_value = field.default_value.clone();
+                    let textarea = cx.new(|cx| {
+                        let mut state = TextareaState::new(window, cx)
+                            .placeholder(placeholder)
+                            .auto_grow(3, 12);
+                        state.set_value(default_value, window, cx);
+                        state
+                    });
+
+                    let value_clone = value.clone();
+                    cx.subscribe_in(
+                        &textarea,
+                        window,
+                        move |_form, input, event, _window, cx| {
+                            if let InputEvent::Change = event {
+                                value_clone.update(cx, |v, cx| {
+                                    *v = input.read(cx).text().to_string();
+                                    cx.notify();
+                                });
+                            }
+                        },
+                    )
+                    .detach();
+
+                    field_textareas.insert(field.name.clone(), textarea);
+                    field_inputs.push(None);
                 } else {
                     let input = cx.new(|cx| {
                         let mut input_state =
@@ -290,16 +321,6 @@ impl MiddlewareConnectionForm {
 
                         if field.field_type == FormFieldType::Password {
                             input_state = input_state.masked(true);
-                        }
-
-                        if field.field_type == FormFieldType::TextArea {
-                            if field.name == "remark" {
-                                input_state = input_state.auto_grow(3, 10);
-                            } else if field.rows == 14 {
-                                input_state = input_state.rows(14);
-                            } else {
-                                input_state = input_state.auto_grow(5, 14);
-                            }
                         }
 
                         input_state.set_value(field.default_value.clone(), window, cx);
@@ -379,6 +400,7 @@ impl MiddlewareConnectionForm {
             field_values,
             field_inputs,
             field_selects,
+            field_textareas,
             credential_picker,
             is_testing,
             test_result,
@@ -565,6 +587,10 @@ impl MiddlewareConnectionForm {
             if let Some(Some(input)) = self.field_inputs.get(idx) {
                 input.update(cx, |input, cx| {
                     input.set_value(value.to_string(), window, cx);
+                });
+            } else if let Some(textarea) = self.field_textareas.get(field_name) {
+                textarea.update(cx, |textarea, cx| {
+                    textarea.set_value(value.to_string(), window, cx);
                 });
             } else if let Some(select) = self.field_selects.get(field_name) {
                 select.update(cx, |select, cx| {
@@ -941,7 +967,6 @@ impl MiddlewareConnectionForm {
         field()
             .label(t!("MiddlewareForm.keychain").to_string())
             .items_center()
-            .label_justify_end()
             .child(div().w_full().child(self.credential_picker.clone()))
     }
 
@@ -976,7 +1001,6 @@ impl MiddlewareConnectionForm {
                 field()
                     .label(self.field_label("ssh_tunnel_enabled"))
                     .items_center()
-                    .label_justify_end()
                     .child(
                         Checkbox::new("middleware-ssh-tunnel-enabled")
                             .checked(ssh_enabled)
@@ -996,7 +1020,6 @@ impl MiddlewareConnectionForm {
                     field()
                         .label(t!("ConnectionForm.ssh_connection_id").to_string())
                         .items_center()
-                        .label_justify_end()
                         .child(
                             Select::new(&self.ssh_connection_select)
                                 .placeholder(t!("ConnectionForm.ssh_connection_manual"))
@@ -1011,7 +1034,6 @@ impl MiddlewareConnectionForm {
                             field()
                                 .label(self.field_label("ssh_auth_type"))
                                 .items_center()
-                                .label_justify_end()
                                 .child(h_flex().w_full().flex_wrap().gap_4().children(
                                     SshAuthOption::ALL.iter().copied().map(|option| {
                                         Radio::new(format!(
@@ -1114,35 +1136,26 @@ impl MiddlewareConnectionForm {
                     field()
                         .label(t!("MiddlewareForm.workspace").to_string())
                         .items_center()
-                        .label_justify_end()
                         .child(Select::new(&self.workspace_select).w_full()),
                 )
                 .when(
                     connection_sync_controls_visible_in(cx) && team_management_enabled(cx),
                     |form| {
                         form.child(
-                            field()
-                                .label(team_label())
-                                .items_center()
-                                .label_justify_end()
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(Select::new(&self.team_select).w_full())
-                                        .child(
-                                            Button::new("sync-middleware-teams")
-                                                .icon(IconName::Refresh)
-                                                .ghost()
-                                                .tooltip(refresh_teams_tooltip())
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    refresh_team_options(
-                                                        &this.team_select,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                })),
-                                        ),
-                                ),
+                            field().label(team_label()).items_center().child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(Select::new(&self.team_select).w_full())
+                                    .child(
+                                        Button::new("sync-middleware-teams")
+                                            .icon(IconName::Refresh)
+                                            .ghost()
+                                            .tooltip(refresh_teams_tooltip())
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                refresh_team_options(&this.team_select, window, cx);
+                                            })),
+                                    ),
+                            ),
                         )
                     },
                 )
@@ -1151,7 +1164,6 @@ impl MiddlewareConnectionForm {
                         field()
                             .label(t!("MiddlewareForm.cloud_sync").to_string())
                             .items_center()
-                            .label_justify_end()
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -1193,7 +1205,6 @@ impl MiddlewareConnectionForm {
             .required(field_info.required)
             .when(!is_textarea, |f| f.items_center())
             .when(is_textarea, |f| f.items_start())
-            .label_justify_end()
             .child(
                 h_flex()
                     .w_full()
@@ -1217,7 +1228,7 @@ impl MiddlewareConnectionForm {
                                 })),
                         )
                     })
-                    .when(!is_select && !is_checkbox, |el| {
+                    .when(!is_select && !is_checkbox && !is_textarea, |el| {
                         if let Some(input_state) = self.get_input_by_name(&field_name) {
                             let input = Input::new(&input_state).w_full();
                             let input = if is_password {
@@ -1226,6 +1237,13 @@ impl MiddlewareConnectionForm {
                                 input
                             };
                             el.child(input)
+                        } else {
+                            el
+                        }
+                    })
+                    .when(is_textarea, |el| {
+                        if let Some(textarea_state) = self.field_textareas.get(&field_name) {
+                            el.child(Textarea::new(textarea_state).w_full())
                         } else {
                             el
                         }

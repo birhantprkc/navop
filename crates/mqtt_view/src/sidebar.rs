@@ -9,12 +9,10 @@ use gpui::{
     AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
     IntoElement, ParentElement, Render, Styled, Subscription, Window, div,
 };
-use gpui_component::{
-    ActiveTheme, IconName, IconSize, ObjectIcon, Selectable, Size, button::IconButton, h_flex,
-    v_flex,
-};
+use gpui_component::{ActiveTheme, IconName, ObjectIcon, Selectable, Size, h_flex, v_flex};
 use one_core::layout::TOOLBAR_WIDTH;
 use one_core::storage::StoredConnection;
+use one_ui::IconButton;
 use rust_i18n::t;
 
 /// 侧边栏面板类型
@@ -158,7 +156,7 @@ impl MqttSidebar {
             ObjectIcon::new(IconName::AILine),
         )
         .hit_size(item_size)
-        .glyph_size(IconSize::Medium)
+        .glyph_size(one_ui::IconSize::Medium)
         .selected(is_active)
         .tooltip(t!("MqttSidebar.ai_chat").to_string())
         .on_click(cx.listener(move |this, _event, _window, cx| {

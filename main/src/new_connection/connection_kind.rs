@@ -23,7 +23,7 @@ pub(super) enum NewConnectionCategory {
 }
 
 impl NewConnectionCategory {
-    pub(super) fn all() -> [Self; 7] {
+    pub(super) fn all() -> [Self; 8] {
         [
             Self::All,
             Self::Database,
