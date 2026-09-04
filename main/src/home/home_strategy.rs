@@ -2,7 +2,9 @@ use crate::home_tab::HomePage;
 use gpui::{Context, Window};
 use gpui_component::WindowExt;
 use one_core::storage::{ConnectionType, StoredConnection, Workspace};
-use one_core::tab_container::{TabItem, TabOpenMode};
+#[cfg(feature = "shell-plugins")]
+use one_core::tab_container::TabItem;
+use one_core::tab_container::TabOpenMode;
 use remote_desktop::RemoteDesktopProtocol;
 
 pub(crate) trait ConnectionOpenStrategy {
@@ -44,15 +46,47 @@ pub(crate) fn build_connection_open_strategy(
             connection,
             protocol: RemoteDesktopProtocol::Vnc,
         }),
-        ConnectionType::Extension => Box::new(ExtensionOpenStrategy { connection }),
+        ConnectionType::Extension => {
+            #[cfg(feature = "shell-plugins")]
+            {
+                Box::new(ExtensionOpenStrategy { connection })
+            }
+            #[cfg(not(feature = "shell-plugins"))]
+            {
+                let _ = &connection;
+                Box::new(ExtensionOpenStrategy {
+                    _connection: connection,
+                })
+            }
+        }
         _ => Box::new(NoopOpenStrategy),
     }
 }
 
 struct ExtensionOpenStrategy {
+    #[cfg(feature = "shell-plugins")]
     connection: StoredConnection,
+    #[cfg(not(feature = "shell-plugins"))]
+    _connection: StoredConnection,
 }
 
+#[cfg(not(feature = "shell-plugins"))]
+impl ConnectionOpenStrategy for ExtensionOpenStrategy {
+    fn open(
+        self: Box<Self>,
+        _home: &mut HomePage,
+        _mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
+        window.push_notification(
+            "Extension connections require the shell-plugins build",
+            cx,
+        );
+    }
+}
+
+#[cfg(feature = "shell-plugins")]
 impl ConnectionOpenStrategy for ExtensionOpenStrategy {
     fn open(
         self: Box<Self>,

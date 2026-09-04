@@ -13,7 +13,7 @@ gpui = { workspace = true }
 gpui_platform = { workspace = true }
 gpui-component = { workspace = true, features = ["tree-sitter-bash", "tree-sitter-sql"] }
 gpui-component-assets = { workspace = true }
-gpui-shell = { workspace = true }
+gpui-shell = { workspace = true, optional = true }
 gpui-component-shell = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -100,6 +100,7 @@ github-distribution = ["github-updates", "github-marketplace"]
 github-marketplace = ["extension-runtime/github-marketplace"]
 github-updates = []
 screenshot-safe = []
+shell-plugins = ["dep:gpui-shell"]
 wasm-components = ["extension-runtime/wasm-components"]
 windows-native-rdp = ["remote_desktop_view/windows-native-rdp"]
 

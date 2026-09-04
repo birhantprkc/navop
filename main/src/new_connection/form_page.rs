@@ -11,6 +11,7 @@ use terminal_view::{
     TelnetFormWindowConfig,
 };
 
+#[cfg(feature = "shell-plugins")]
 use crate::extension_connection_form::{ExtensionConnectionForm, ExtensionConnectionFormConfig};
 use crate::home_tab::HomePage;
 use crate::new_connection::NewConnectionWindow;
@@ -69,11 +70,15 @@ impl NewConnectionFormPage for NewConnectionKind {
                     cx,
                 )
             }
+            #[cfg(feature = "shell-plugins")]
             Self::Extension(contribution) => build_extension_form(parent, contribution, window, cx),
+            #[cfg(not(feature = "shell-plugins"))]
+            Self::Extension(_) => NewConnectionFormResult::Blocked,
         }
     }
 }
 
+#[cfg(feature = "shell-plugins")]
 fn build_extension_form(
     parent: Entity<HomePage>,
     contribution: extension_runtime::RegisteredResourceConnectionContribution,
