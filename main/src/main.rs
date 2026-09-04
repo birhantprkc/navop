@@ -395,8 +395,6 @@ fn main() {
             file_association::schedule_registration(cx);
         }
         notes::init(cx);
-        #[cfg(feature = "api-testing")]
-        api_tools::init(cx);
         extension_runtime::init(cx);
         universal_plugins::init(cx);
 
