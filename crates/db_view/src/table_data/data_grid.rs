@@ -8,9 +8,11 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, WindowExt,
     button::Button,
+    checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState},
     notification::Notification,
+    popover::Popover,
     scroll::{Scrollbar, ScrollbarMode},
     v_flex,
 };
@@ -65,53 +67,199 @@ actions!(
     [Page500, Page1000, Page2000, Page10000, Page100000]
 );
 
-/// 构建「字段过滤」菜单：先给出“显示全部字段”快捷项，再按展示顺序列出每个字段。
+/// 「字段过滤」面板的尺寸与行高。
 ///
-/// 菜单在点击时构建，因此可以读到最新的列可见状态。
-fn build_column_visibility_menu(
-    menu: PopupMenu,
-    data_grid: &Entity<DataGrid>,
-    cx: &mut Context<PopupMenu>,
-) -> PopupMenu {
-    let entries = data_grid.read(cx).column_visibility_entries(cx);
-    let total = entries.len();
-    let visible_total = entries.iter().filter(|(_, _, visible)| *visible).count();
+/// 面板固定宽度；字段列表的高度按行数算、封顶后再内部滚动。行高必须是确定值：
+/// 滚动区的高度由它乘出来，行高一变列表就会被撑开、滚动条也跟着失效。
+pub(super) const COLUMN_VISIBILITY_PANEL_WIDTH: Pixels = px(240.);
+pub(super) const COLUMN_VISIBILITY_PANEL_MAX_HEIGHT: Pixels = px(320.);
+pub(super) const COLUMN_VISIBILITY_ROW_HEIGHT: Pixels = px(28.);
 
-    let reset_grid = data_grid.clone();
-    let mut menu = menu
-        .label(t!("TableDataGrid.column_visibility_hint").to_string())
-        .separator()
-        .item(
-            PopupMenuItem::new(t!("TableDataGrid.show_all_columns").to_string())
-                .checked(visible_total == total)
-                .disabled(visible_total == total)
-                .on_click(move |_, _window, cx| {
-                    reset_grid.update(cx, |grid, cx| grid.show_all_columns(cx));
-                }),
+/// 「字段过滤」面板要渲染的全部数据。
+///
+/// `rows` 已经过搜索词过滤，而计数要用全量字段数当分母：搜索时也要能看出
+/// 「匹配了几个 / 一共多少列、当前显示几个」。
+pub(super) struct ColumnVisibilityPanelState {
+    /// 当前搜索词过滤后、按展示顺序排列的字段：`(原始列索引, 名称, 是否可见)`。
+    pub rows: Vec<(usize, SharedString, bool)>,
+    /// 字段总数（不受搜索影响）。
+    pub total: usize,
+    /// 当前可见字段数。
+    pub visible_total: usize,
+}
+
+/// 按搜索词过滤字段条目。
+///
+/// 空串不过滤；命中规则是不区分大小写的子串匹配——字段名多是 snake_case，
+/// 用户输入 `id` 时不应被迫记住大小写。
+pub(super) fn filter_column_visibility_entries(
+    entries: &[(usize, SharedString, bool)],
+    query: &str,
+) -> Vec<(usize, SharedString, bool)> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return entries.to_vec();
+    }
+    entries
+        .iter()
+        .filter(|(_, name, _)| name.to_lowercase().contains(&query))
+        .cloned()
+        .collect()
+}
+
+/// 构建「字段过滤」面板：标题与计数、字段搜索框、勾选列表（限高滚动）、
+/// 底部提示与「显示全部字段」。
+///
+/// 面板内容每次渲染都会重建，因此读到的搜索词与列可见状态永远是最新的。
+pub(super) fn build_column_visibility_panel(data_grid: &Entity<DataGrid>, cx: &App) -> AnyElement {
+    let state = data_grid.read(cx).column_visibility_panel_state(cx);
+    let ColumnVisibilityPanelState {
+        rows,
+        total,
+        visible_total,
+    } = state;
+    let row_hover_bg = cx.theme().muted;
+    let search_input = data_grid.read(cx).column_visibility_search.clone();
+
+    let header = h_flex()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_3()
+        .pt_2()
+        .pb_1()
+        .child(
+            div()
+                .text_sm()
+                .child(t!("TableDataGrid.column_visibility").to_string()),
         )
-        .separator();
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                // 与查找框同款计数写法：显示几个 / 一共几列。
+                .child(format!("{visible_total}/{total}")),
+        );
 
-    for (original_ix, name, visible) in entries {
-        let label = if name.trim().is_empty() {
-            t!("TableDataGrid.unnamed_column").to_string()
+    let search = div().w_full().px_3().pb_2().child(
+        Input::new(&search_input)
+            .prefix(Icon::new(IconName::Search).text_color(cx.theme().muted_foreground))
+            .cleanable(true)
+            .w_full(),
+    );
+
+    let mut list = v_flex().id("column-visibility-list").w_full();
+    if rows.is_empty() {
+        list = list.child(
+            div()
+                .h(COLUMN_VISIBILITY_ROW_HEIGHT)
+                .px_3()
+                .flex()
+                .items_center()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(t!("TableDataGrid.search_no_match").to_string()),
+        );
+    }
+    for (ix, (original_ix, name, visible)) in rows.iter().cloned().enumerate() {
+        let label: SharedString = if name.trim().is_empty() {
+            t!("TableDataGrid.unnamed_column").to_string().into()
         } else {
-            name.to_string()
+            name
         };
         // 只剩最后一个可见字段时禁止继续隐藏，避免整表无列。
         let is_last_visible = visible && visible_total <= 1;
         let grid = data_grid.clone();
-        menu = menu.item(
-            PopupMenuItem::new(label)
-                .checked(visible)
-                .disabled(is_last_visible)
-                .on_click(move |_, _window, cx| {
-                    grid.update(cx, |grid, cx| {
-                        grid.toggle_column_visibility(original_ix, cx)
-                    });
-                }),
+        list = list.child(
+            h_flex()
+                .id(("column-visibility-row", ix))
+                .w_full()
+                .h(COLUMN_VISIBILITY_ROW_HEIGHT)
+                .items_center()
+                .gap_2()
+                .px_3()
+                .when(!is_last_visible, |this| {
+                    this.hover(move |style| style.bg(row_hover_bg)).on_click(
+                        move |_, _window, cx| {
+                            grid.update(cx, |grid, cx| {
+                                grid.set_column_visibility(original_ix, !visible, cx)
+                            });
+                        },
+                    )
+                })
+                // 勾选框只负责显示，点击交给整行：勾选框与文字都能点，
+                // 两个都挂处理器会让一次点击翻转两遍。
+                .child(
+                    Checkbox::new(("column-visibility-check", ix))
+                        .checked(visible)
+                        .disabled(is_last_visible),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_sm()
+                        .child(label),
+                ),
         );
     }
-    menu
+
+    // 列表高度按行数算出来再封顶：滚动区必须有确定高度，否则内容会把容器
+    // 撑到全部展开——滚动条永远不出现，看起来就像“根本不能滚”。
+    let list_height = (COLUMN_VISIBILITY_ROW_HEIGHT * rows.len().max(1) as f32)
+        .min(COLUMN_VISIBILITY_PANEL_MAX_HEIGHT);
+    let list = list
+        .h(list_height)
+        .overflow_y_scroll()
+        .track_scroll(&data_grid.read(cx).column_visibility_scroll.clone());
+
+    let reset_grid = data_grid.clone();
+    let footer = h_flex()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .child(
+            div()
+                .min_w_0()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(t!("TableDataGrid.column_visibility_keep_one_hint").to_string()),
+        )
+        .child(
+            Button::new("column-visibility-all")
+                .ghost()
+                .with_size(Size::XSmall)
+                .label(t!("TableDataGrid.show_all_columns").to_string())
+                .disabled(visible_total == total)
+                .on_click(move |_, _window, cx| {
+                    reset_grid.update(cx, |grid, cx| grid.show_all_columns(cx));
+                }),
+        );
+
+    v_flex()
+        .child(header)
+        .child(search)
+        // 滚动条放在非滚动容器上：它是绝对定位的，放进滚动容器会跟着内容跑。
+        .child(
+            div().relative().child(list).child(
+                div().absolute().inset_0().child(
+                    Scrollbar::vertical(&data_grid.read(cx).column_visibility_scroll)
+                        .mode(ScrollbarMode::Always)
+                        .viewport_from_layout(),
+                ),
+            ),
+        )
+        .child(footer)
+        .into_any_element()
 }
 
 /// 构建「显示方式」菜单：网格 / 纵向「列：值」。
@@ -978,6 +1126,13 @@ pub struct DataGrid {
     find_input: Entity<InputState>,
     /// 查找输入框事件订阅
     _find_sub: Option<Subscription>,
+    /// 「字段过滤」面板里的字段搜索框（面板关着时也一直是同一个实体，
+    /// 打开时才能直接接着上次的搜索词）
+    column_visibility_search: Entity<InputState>,
+    /// 字段搜索框事件订阅
+    _column_visibility_search_sub: Option<Subscription>,
+    /// 「字段过滤」面板的字段列表滚动句柄
+    column_visibility_scroll: ScrollHandle,
     /// 当前数据库 tab 的共享 SQL 执行记录
     execution_history: Option<Entity<ExecutionHistoryPanel>>,
     /// 侧边栏大文本编辑器是否已为当前表格打开
@@ -1025,6 +1180,13 @@ impl DataGrid {
                 .placeholder(t!("TableDataGrid.search_placeholder").to_string())
                 .clean_on_escape()
         });
+        // 字段搜索框在弹出面板里，不能等面板打开再建：弹出面板的内容闭包
+        // 每次渲染都会重跑，在那里建实体会每次换一个新的、光标也跟着丢。
+        let column_visibility_search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("TableDataGrid.column_visibility_search_placeholder").to_string())
+                .clean_on_escape()
+        });
         let table_data_info = cx.new(|_| TableDataInfo::default());
         let mut result = Self {
             config,
@@ -1037,6 +1199,9 @@ impl DataGrid {
             _filter_sub: None,
             find_input,
             _find_sub: None,
+            column_visibility_search,
+            _column_visibility_search_sub: None,
+            column_visibility_scroll: ScrollHandle::default(),
             execution_history,
             is_large_text_editor_sidebar_open: false,
             data_generation: Arc::new(AtomicU64::new(0)),
@@ -1047,6 +1212,7 @@ impl DataGrid {
             vertical_font_cache: None,
         };
         result.bind_table_event(window, cx);
+        result.bind_column_visibility_search_event(window, cx);
         if is_table_data {
             // 表格数据页的查找输入框就在工具栏里（同页唯一一个搜索框），
             // 表格自身不再浮出查找面板。
@@ -1086,6 +1252,23 @@ impl DataGrid {
         );
         self._table_sub = Some(sub);
         self._table_observe_sub = Some(cx.observe(&self.table, |_, _, cx| cx.notify()));
+    }
+
+    /// 字段搜索框 → 「字段过滤」面板的列表过滤。
+    ///
+    /// 搜索词只影响面板自己的列表，不碰表格：这里只需要让宿主重画，
+    /// 面板在下一次渲染里自己读最新的输入值。
+    fn bind_column_visibility_search_event(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sub = cx.subscribe_in(
+            &self.column_visibility_search,
+            window,
+            |_this: &mut DataGrid, _input, evt: &InputEvent, _window, cx| {
+                if let InputEvent::Change = evt {
+                    cx.notify();
+                }
+            },
+        );
+        self._column_visibility_search_sub = Some(sub);
     }
 
     fn bind_filter_event(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1163,24 +1346,27 @@ impl DataGrid {
 
     // ========== 字段（列）过滤 ==========
 
-    /// 当前所有列的展示名称与可见状态，供「字段过滤」菜单渲染。
-    pub fn column_visibility_entries(&self, cx: &App) -> Vec<(usize, SharedString, bool)> {
-        self.table.read(cx).delegate().column_visibility_entries()
+    /// 「字段过滤」面板的展示数据：搜索词过滤后的字段，以及计数要用到的
+    /// 总数与当前可见数。
+    ///
+    /// 过滤是纯函数（`filter_column_visibility_entries`），这里只负责把
+    /// 搜索框里的字和列状态凑到一起。
+    fn column_visibility_panel_state(&self, cx: &App) -> ColumnVisibilityPanelState {
+        let entries = self.table.read(cx).delegate().column_visibility_entries();
+        let total = entries.len();
+        let visible_total = entries.iter().filter(|(_, _, visible)| *visible).count();
+        let query = self.column_visibility_search.read(cx).text().to_string();
+
+        ColumnVisibilityPanelState {
+            rows: filter_column_visibility_entries(&entries, &query),
+            total,
+            visible_total,
+        }
     }
 
     /// 是否存在被隐藏的列。
     pub fn has_hidden_columns(&self, cx: &App) -> bool {
         self.table.read(cx).delegate().has_hidden_columns()
-    }
-
-    /// 切换某一列的可见性，成功后刷新表头与列布局。
-    pub fn toggle_column_visibility(&mut self, original_ix: usize, cx: &mut Context<Self>) {
-        let visible = self
-            .table
-            .read(cx)
-            .delegate()
-            .is_column_visible(original_ix);
-        self.set_column_visibility(original_ix, !visible, cx);
     }
 
     /// 显示全部列。
@@ -3725,15 +3911,20 @@ impl DataGrid {
         let loading = self.table.read(cx).delegate().is_loading();
         let has_hidden = self.table.read(cx).delegate().has_hidden_columns();
 
-        Button::new("column-visibility")
-            .with_size(Size::Medium)
-            .icon(IconName::Column)
-            .when(has_hidden, |this| this.primary())
-            .tooltip(t!("TableDataGrid.column_visibility").to_string())
-            .disabled(loading)
-            .dropdown_menu(move |menu, _window, cx| {
-                build_column_visibility_menu(menu, &data_grid, cx)
-            })
+        // 用弹出面板而不是下拉菜单：字段多的时候菜单会一路顶到窗口底部，
+        // 面板可以固定尺寸、把字段列表关在内部滚动区里。
+        Popover::new("column-visibility")
+            .trigger(
+                Button::new("column-visibility")
+                    .with_size(Size::Medium)
+                    .icon(IconName::Column)
+                    .when(has_hidden, |this| this.primary())
+                    .tooltip(t!("TableDataGrid.column_visibility").to_string())
+                    .disabled(loading),
+            )
+            .content(move |_state, _window, cx| build_column_visibility_panel(&data_grid, cx))
+            .w(COLUMN_VISIBILITY_PANEL_WIDTH)
+            .p_0()
             .into_any_element()
     }
 
@@ -4287,6 +4478,9 @@ impl Clone for DataGrid {
             _filter_sub: None,
             find_input: self.find_input.clone(),
             _find_sub: None,
+            column_visibility_search: self.column_visibility_search.clone(),
+            _column_visibility_search_sub: None,
+            column_visibility_scroll: self.column_visibility_scroll.clone(),
             execution_history: self.execution_history.clone(),
             is_large_text_editor_sidebar_open: self.is_large_text_editor_sidebar_open,
             data_generation: self.data_generation.clone(),
