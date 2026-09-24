@@ -3090,8 +3090,8 @@ const DATABASE_SHORTCUTS: &[ShortcutEntry] = &[
         system_hotkey: false,
     },
     ShortcutEntry {
-        keys_macos: &["cmd-/", "ctrl-/"],
-        keys_other: &["cmd-/", "ctrl-/"],
+        keys_macos: &["cmd-/"],
+        keys_other: &["ctrl-/"],
         label_key: "Settings.Shortcuts.sql_toggle_comment",
         action_id: Some(action_id::SQL_TOGGLE_COMMENT),
         system_hotkey: false,

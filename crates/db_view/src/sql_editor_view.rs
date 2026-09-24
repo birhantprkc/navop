@@ -72,7 +72,21 @@ const SQL_EDITOR_CONTEXT: &str = "SqlEditor";
 const SQL_EDITOR_INPUT_CONTEXT: &str = "SqlEditor > Input";
 const RUN_CURRENT_QUERY_KEY_BINDINGS: [&str; 2] = ["cmd-enter", "ctrl-enter"];
 const RUN_ALL_QUERY_KEY_BINDINGS: [&str; 2] = ["cmd-shift-enter", "ctrl-shift-enter"];
-const TOGGLE_LINE_COMMENT_KEY_BINDINGS: [&str; 2] = ["cmd-/", "ctrl-/"];
+
+/// 「注释 / 取消注释」的默认键位（#290）。
+///
+/// 按平台给**单一**默认值，不做双绑：`cmd-/` 在 Windows / Linux 上是 Win 键（按不到），
+/// 而 `ctrl-/` 在 macOS 上又会被输入框自己的「全选」抢（见
+/// `ctrl_slash_binding_wins_inside_sql_input_context`），两边都列只会让人以为绑了两个。
+/// 设置面板展示的是同一对值：`main/src/setting_tab.rs` 的 `sql_toggle_comment` 条目。
+fn toggle_line_comment_defaults() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &["cmd-/"]
+    } else {
+        &["ctrl-/"]
+    }
+}
+
 /// Maximum number of concurrent `list_columns` requests while refreshing the
 /// SQL editor schema for a database. Keeps large-schema loads from serializing
 /// a full per-table catalog scan or saturating the backend with an unbounded
@@ -235,7 +249,7 @@ fn toggle_line_comment_shortcuts(cx: &App) -> Vec<String> {
     shortcuts_for(
         cx,
         action_id::SQL_TOGGLE_COMMENT,
-        &TOGGLE_LINE_COMMENT_KEY_BINDINGS,
+        toggle_line_comment_defaults(),
     )
 }
 
@@ -260,11 +274,14 @@ fn refreshable_keybindings(cx: &App) -> Vec<KeyBinding> {
         Some(SQL_EDITOR_CONTEXT),
         RunAllQuery,
     ));
-    keybindings.extend(
-        toggle_line_comment_shortcuts(cx)
-            .into_iter()
-            .map(|key| KeyBinding::new(&key, ToggleLineComment, Some(SQL_EDITOR_INPUT_CONTEXT))),
-    );
+    // 注释键也必须走 rebind：否则改了键位之后，init 时绑的默认键还留在 keymap 里。
+    keybindings.extend(rebind_keybindings(
+        cx,
+        action_id::SQL_TOGGLE_COMMENT,
+        toggle_line_comment_defaults(),
+        Some(SQL_EDITOR_INPUT_CONTEXT),
+        ToggleLineComment,
+    ));
     keybindings
 }
 
@@ -726,6 +743,11 @@ struct OffsetEdit {
     replacement_len: usize,
 }
 
+/// SQL 行注释标记。带一个尾随空格：在空白行上按一次就得到 `-- `，光标停在后面可以直接接着写。
+const SQL_LINE_COMMENT_MARKER: &str = "-- ";
+
+/// 逐行增删行注释。空白行也补 `-- `（用户可以先在空行上生成注释、再写内容），
+/// 取消注释时空白行保持原样。
 fn toggle_sql_line_comments(text: &str, selection: Range<usize>) -> LineCommentResult {
     let selection_start = clamp_to_char_boundary(text, selection.start.min(text.len()));
     let selection_end =
@@ -755,18 +777,34 @@ fn toggle_sql_line_comments(text: &str, selection: Range<usize>) -> LineCommentR
 
     let mut edits = Vec::new();
     let mut relative_line_start = 0;
+    // 光标所在的空白行补上注释后，光标要跟着落到 `-- ` 后面，否则接着敲字会落在注释前面。
+    let mut caret_after_blank_line_marker = None;
     for line in lines {
         let content = line.strip_suffix('\r').unwrap_or(line);
-        if content.trim_matches([' ', '\t']).is_empty() {
+        let is_blank = content.trim_matches([' ', '\t']).is_empty();
+        if is_blank && uncomment {
+            // 空白行没有注释符可去，保持原样。
             relative_line_start += line.len() + 1;
             continue;
         }
         let indentation_len = content.len() - content.trim_start_matches([' ', '\t']).len();
         let edit_start = line_start + relative_line_start + indentation_len;
+        if is_blank && selection_start == selection_end {
+            let line_abs_start = line_start + relative_line_start;
+            if selection_start >= line_abs_start
+                && selection_start <= line_abs_start + content.len()
+            {
+                caret_after_blank_line_marker = Some(edit_start);
+            }
+        }
 
         if uncomment {
             let comment = &content[indentation_len..];
-            let removed_len = if comment.starts_with("-- ") { 3 } else { 2 };
+            let removed_len = if comment.starts_with(SQL_LINE_COMMENT_MARKER) {
+                SQL_LINE_COMMENT_MARKER.len()
+            } else {
+                2
+            };
             edits.push(OffsetEdit {
                 range: edit_start..edit_start + removed_len,
                 replacement_len: 0,
@@ -774,7 +812,7 @@ fn toggle_sql_line_comments(text: &str, selection: Range<usize>) -> LineCommentR
         } else {
             edits.push(OffsetEdit {
                 range: edit_start..edit_start,
-                replacement_len: 3,
+                replacement_len: SQL_LINE_COMMENT_MARKER.len(),
             });
         }
 
@@ -784,12 +822,21 @@ fn toggle_sql_line_comments(text: &str, selection: Range<usize>) -> LineCommentR
     let mut replacement = target.to_owned();
     for edit in edits.iter().rev() {
         let edit_range = edit.range.start - line_start..edit.range.end.saturating_sub(line_start);
-        let inserted_text = if edit.replacement_len == 0 { "" } else { "-- " };
+        let inserted_text = if edit.replacement_len == 0 {
+            ""
+        } else {
+            SQL_LINE_COMMENT_MARKER
+        };
         replacement.replace_range(edit_range, inserted_text);
     }
 
     let mapped_selection = if selection_start == selection_end {
-        let cursor = map_offset_after_edits(selection_start, &edits, true);
+        let cursor = match caret_after_blank_line_marker {
+            Some(insert_start) => {
+                map_offset_after_edits(insert_start, &edits, false) + SQL_LINE_COMMENT_MARKER.len()
+            }
+            None => map_offset_after_edits(selection_start, &edits, true),
+        };
         cursor..cursor
     } else {
         map_offset_after_edits(selection_start, &edits, false)
@@ -5004,12 +5051,11 @@ mod tests {
         ManualTransactionStopAction, QueryFileNameError, QueryToolbarAction,
         RUN_ALL_QUERY_KEY_BINDINGS, RUN_CURRENT_QUERY_KEY_BINDINGS, RunCurrentQuery,
         SCHEMA_COLUMN_FETCH_CONCURRENCY, SQL_EDITOR_CONTEXT, SQL_EDITOR_INPUT_CONTEXT,
-        SqlDiagnosticIdentity, SqlMetadataScope, StatementScanInput,
-        TOGGLE_LINE_COMMENT_KEY_BINDINGS, ToggleLineComment, can_start_query_execution,
-        can_switch_query_connection, collect_bounded, current_statement_frame_decorations,
-        foreign_prefetch_key, foreign_qualifier_fetch_scope, foreign_qualifier_scope,
-        initial_database_select_value, insert_target_table, insert_values_range,
-        is_current_diagnostic_identity, is_current_manual_transaction_owner,
+        SqlDiagnosticIdentity, SqlMetadataScope, StatementScanInput, ToggleLineComment,
+        can_start_query_execution, can_switch_query_connection, collect_bounded,
+        current_statement_frame_decorations, foreign_prefetch_key, foreign_qualifier_fetch_scope,
+        foreign_qualifier_scope, initial_database_select_value, insert_target_table,
+        insert_values_range, is_current_diagnostic_identity, is_current_manual_transaction_owner,
         is_current_manual_transaction_start, is_current_query_context_generation,
         lookup_table_columns, manual_sql_execution_action, manual_transaction_control_sql,
         manual_transaction_invalidation_mode, manual_transaction_stop_action,
@@ -5017,9 +5063,9 @@ mod tests {
         query_connection_context_label, query_connection_ids, query_file_path_for_name,
         query_toolbar_action, schema_changed_event_matches_scope, should_render_schema_select,
         sql_text_for_run_all, sql_text_for_toolbar_run, statement_for_gutter_marker,
-        statement_marker_id, supports_manual_transactions, toggle_sql_line_comments,
-        transaction_liveness, unquote_sql_identifier, viewport_statement_scan_input,
-        write_new_sql_file, write_sql_file,
+        statement_marker_id, supports_manual_transactions, toggle_line_comment_defaults,
+        toggle_sql_line_comments, transaction_liveness, unquote_sql_identifier,
+        viewport_statement_scan_input, write_new_sql_file, write_sql_file,
     };
     use crate::sql_editor::SqlEditor;
     use db::DbManager;
@@ -6210,12 +6256,91 @@ mod tests {
         assert_eq!(1, hits.get(), "用户自定义的注释快捷键应命中");
     }
 
+    /// 真实序列：应用先按默认键位启动，用户在「设置 → 快捷键」里改键之后，
+    /// 新键必须立刻生效、旧键必须立刻失效。
+    ///
+    /// 与上一个用例的区别：那个用**全新 init + 预先塞好 override**，绕过了
+    /// 运行中改键这条真实路径（默认绑定已在 keymap 里，刷新时要把它顶掉）。
+    #[gpui::test]
+    fn toggle_line_comment_shortcut_follows_a_live_rebind(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(AppSettings::default());
+            super::init(cx);
+        });
+
+        let hits = Rc::new(Cell::new(0_usize));
+        let (mut cx, _probe) = open_comment_probe(cx, hits.clone());
+
+        cx.simulate_keystrokes(comment_shortcut_keystroke());
+        cx.run_until_parked();
+        assert_eq!(1, hits.get(), "默认键位应可用（基线）");
+
+        // 等价于 set_custom_keybinding：写 override + 刷新快捷键（不落盘）
+        cx.update(|_window, cx| {
+            let mut settings = AppSettings::default();
+            settings.custom_keybindings.insert(
+                one_core::keybindings::action_id::SQL_TOGGLE_COMMENT.to_string(),
+                vec![override_comment_keystroke().to_string()],
+            );
+            cx.set_global(settings);
+            super::refresh_keybindings(cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes(override_comment_keystroke());
+        cx.run_until_parked();
+        let after_new_key = hits.get();
+
+        cx.simulate_keystrokes(comment_shortcut_keystroke());
+        cx.run_until_parked();
+        let after_old_key = hits.get();
+
+        assert_eq!(
+            (2, 2),
+            (after_new_key, after_old_key),
+            "改键后：新键应生效、旧键应失效（各计一次命中）"
+        );
+    }
+
     /// 设置面板里列出的默认键位必须与运行时默认值一致。
     ///
     /// 「设置 → 快捷键」是这条快捷键唯一的可发现入口（#290 里用户正是找不到它），
     /// 一旦两边漂移，用户看到的和实际生效的就不是一回事。
     #[test]
     fn comment_shortcut_defaults_match_the_settings_panel() {
+        let macos = panel_comment_shortcut_keys("keys_macos:");
+        let other = panel_comment_shortcut_keys("keys_other:");
+
+        assert_eq!(
+            vec!["cmd-/".to_string()],
+            macos,
+            "macOS 的默认键位应只有 cmd+/（不做双绑）"
+        );
+        assert_eq!(
+            vec!["ctrl-/".to_string()],
+            other,
+            "Windows / Linux 的默认键位应只有 ctrl+/（不做双绑）"
+        );
+
+        // 当前平台那一列必须与运行时默认值逐字一致。
+        let panel = if cfg!(target_os = "macos") {
+            &macos
+        } else {
+            &other
+        };
+        assert_eq!(
+            toggle_line_comment_defaults()
+                .iter()
+                .map(|key| key.to_string())
+                .collect::<Vec<_>>(),
+            panel.clone(),
+            "设置面板列出的默认键位必须与运行时默认值一致"
+        );
+    }
+
+    /// 从设置面板的源码里取出注释快捷键条目某个平台字段列出的键位。
+    fn panel_comment_shortcut_keys(field: &str) -> Vec<String> {
         let settings_source = include_str!("../../../main/src/setting_tab.rs");
         let anchor = settings_source
             .find("action_id::SQL_TOGGLE_COMMENT")
@@ -6224,17 +6349,22 @@ mod tests {
             .rfind("ShortcutEntry {")
             .expect("注释快捷键的 ShortcutEntry");
         let entry = &settings_source[entry_start..anchor];
-
-        for key in TOGGLE_LINE_COMMENT_KEY_BINDINGS {
-            assert!(
-                entry.contains(&format!("\"{key}\"")),
-                "设置面板缺少默认键位 {key}"
-            );
-        }
         assert!(
             entry.contains("Settings.Shortcuts.sql_toggle_comment"),
             "设置面板条目必须带词条 key，否则界面显示不出名字"
         );
+
+        let field_start = entry
+            .find(field)
+            .unwrap_or_else(|| panic!("设置面板缺少 {field}"));
+        let list = &entry[field_start..];
+        let start = list.find('[').expect("键位列表起始");
+        let end = list[start..].find(']').expect("键位列表结束") + start;
+        list[start + 1..end]
+            .split(',')
+            .map(|key| key.trim().trim_matches('"').to_string())
+            .filter(|key| !key.is_empty())
+            .collect()
     }
 
     #[test]
@@ -6292,6 +6422,43 @@ mod tests {
 
         assert_eq!(
             "  -- select * from 用户表;\r\n\t-- where 名称 = '测试';",
+            commented.apply_to(sql)
+        );
+    }
+
+    #[test]
+    fn toggle_line_comment_comments_a_blank_line_and_puts_the_caret_after_the_marker() {
+        let sql = "select 1\n\nselect 2";
+        let blank_line = sql.find('\n').expect("first line ends") + 1;
+
+        let commented = toggle_sql_line_comments(sql, blank_line..blank_line);
+        assert_eq!("select 1\n-- \nselect 2", commented.apply_to(sql));
+        assert_eq!(blank_line + 3..blank_line + 3, commented.selection);
+
+        let commented_sql = commented.apply_to(sql);
+        let uncommented = toggle_sql_line_comments(&commented_sql, commented.selection.clone());
+        assert_eq!(sql, uncommented.apply_to(&commented_sql));
+    }
+
+    #[test]
+    fn toggle_line_comment_comments_an_indented_blank_line_after_the_indentation() {
+        let sql = "select 1\n    \nselect 2";
+        let blank_line = sql.find('\n').expect("first line ends") + 1;
+
+        let commented = toggle_sql_line_comments(sql, blank_line..blank_line);
+
+        assert_eq!("select 1\n    -- \nselect 2", commented.apply_to(sql));
+        assert_eq!(blank_line + 7..blank_line + 7, commented.selection);
+    }
+
+    #[test]
+    fn toggle_line_comment_comments_blank_lines_inside_a_selection() {
+        let sql = "select id\n\n  from users";
+
+        let commented = toggle_sql_line_comments(sql, 0..sql.len());
+
+        assert_eq!(
+            "-- select id\n-- \n  -- from users",
             commented.apply_to(sql)
         );
     }
