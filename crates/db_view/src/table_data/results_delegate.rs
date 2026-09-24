@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -101,6 +102,25 @@ pub enum VerticalCellValue {
     /// 普通文本
     Text(String),
 }
+
+impl VerticalCellValue {
+    /// 纵向视图里这条值最终显示出来的文本。
+    ///
+    /// 渲染与横向宽度估算共用同一口径，避免两处漂移（二进制值显示的是大小
+    /// 描述而不是原始字节，宽度也得按描述算）。
+    pub fn display_text(&self) -> Cow<'_, str> {
+        match self {
+            VerticalCellValue::Null => Cow::Borrowed(VERTICAL_NULL_TEXT),
+            VerticalCellValue::Binary { byte_len } => {
+                Cow::Owned(t!("TableData.binary_value", size = byte_len).to_string())
+            }
+            VerticalCellValue::Text(text) => Cow::Borrowed(text.as_str()),
+        }
+    }
+}
+
+/// 纵向视图里 NULL 的占位文本（与网格单元格一致）。
+pub const VERTICAL_NULL_TEXT: &str = "NULL";
 
 /// 纵向「列：值」视图里的一行：一个可见字段的列名与值。
 #[derive(Clone, Debug, PartialEq, Eq)]
