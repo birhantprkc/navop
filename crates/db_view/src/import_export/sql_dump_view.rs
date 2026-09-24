@@ -801,7 +801,7 @@ impl Render for SqlDumpView {
                             Button::new("close")
                                 .child(t!("SqlDump.close").to_string())
                                 .on_click(|_, window, _cx| {
-                                    window.remove_window();
+                                    let _ = one_core::window_close::close_window_for_reuse(window);
                                 }),
                         )
                     }),
