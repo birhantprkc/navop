@@ -105,8 +105,8 @@ impl Render for OfflinePackageDialogView {
                             .small()
                             .primary()
                             .label(t!("Common.confirm").to_string())
-                            .on_click(cx.listener(|_view, _, window, _cx| {
-                                let _ = one_core::window_close::close_window_for_reuse(window);
+                            .on_click(cx.listener(|_view, _, window, cx| {
+                                let _ = one_core::window_close::close_window_for_reuse(window, cx);
                             })),
                     ),
             )

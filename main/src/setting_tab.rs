@@ -2417,16 +2417,17 @@ impl GlobalProxySettingsView {
         apply_global_proxy_settings(proxy_settings, new_client, cx);
 
         window.push_notification(t!("Settings.General.Proxy.save_success").to_string(), cx);
-        // macOS 上「关」只是隐藏，下次打开会用 `GlobalProxySettingsView::new` 重建 view，
-        // 表单自然回到生效值 —— 不需要在关闭前手工复位。
-        let _ = close_window_for_reuse(window);
+        // macOS 上「关」只是隐藏原生窗口，业务会话当场卸载（view 连同表单一起释放），
+        // 下次打开才会用 `GlobalProxySettingsView::new` 重建 —— 表单自然回到生效值，
+        // 不需要在关闭前手工复位。
+        let _ = close_window_for_reuse(window, cx);
     }
 
-    fn on_cancel(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+    fn on_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.testing {
             return;
         }
-        let _ = close_window_for_reuse(window);
+        let _ = close_window_for_reuse(window, cx);
     }
 }
 
@@ -3752,9 +3753,10 @@ mod tests {
 
         for signature in ["fn on_cancel(", "fn on_save("] {
             let body = method_source(source, signature);
+            // 必须走带 `cx` 的关闭入口：只有它能在隐藏原生窗口的同时卸载业务会话。
             assert!(
-                body.contains("close_window_for_reuse(window)"),
-                "{signature} must hide the window instead of destroying it"
+                body.contains("close_window_for_reuse(window, cx)"),
+                "{signature} must close through the session-ending reuse route"
             );
             assert!(
                 !body.contains("window.remove_window()"),

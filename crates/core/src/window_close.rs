@@ -50,6 +50,9 @@ pub fn init(cx: &mut App) {
                 .state
                 .remove(window_id);
         }
+        // 复用弹窗的登记表同样按 window_id 清理：窗口真的被销毁（非 macOS、隐藏失败回落、
+        // 应用退出）而条目还留着，就会变成永远不会被复用的脏条目。
+        crate::popup_window::forget_reusable_popup_by_window(window_id);
     });
     cx.set_global(WindowCloseRegistry {
         state: WindowCloseState::default(),
@@ -150,16 +153,28 @@ pub fn hide_for_reuse(_window: &Window) -> anyhow::Result<bool> {
 /// 一律照旧销毁 —— 隐藏一个没人会重新显示的窗口只是泄漏。这条兜底让视图层可以放心
 /// 用这个函数替换 `window.remove_window()`，写错了也只是回到原行为。
 ///
-/// 复用**不会**重建 view 吗？会重建。重新显示时会用**本次调用**的 factory 重建，所以调用方
-/// 只要保证「同一个键每次打开都能给出正确内容」即可，不需要自己写复位逻辑。
-pub fn close_window_for_reuse(window: &mut Window) -> bool {
+/// # 「关闭」包含两件事，缺一不可
+///
+/// 1. **原生窗口**：隐藏并留着复用 —— 这是绕开 AppKit Touch Bar 观察者注销崩溃的那一步；
+/// 2. **业务会话**：结束掉 —— 卸载业务 view 及它持有的数据与任务句柄，清掉焦点和通知。
+///
+/// 第 2 步不能省。只隐藏、把上一次的 view 留到下次打开才替换，就会在用户不再打开那类窗口时
+/// 一直扣着那份数据（**强引用来自仍然存活的内容树**，注册表里的 `WeakEntity` 管不到它）。
+/// 会话卸载在关闭动作内部**同步**完成，所以不存在「上一轮的清理删掉刚打开的新会话」的窗口期 ——
+/// 这也是不把它交给 `defer` 的原因。
+///
+/// 参数里有 `cx` 就是因为第 2 步必须能更新内容实体；只有 `&mut Window` 的接口做不到。
+pub fn close_window_for_reuse(window: &mut Window, cx: &mut App) -> bool {
     if !crate::popup_window::is_reusable_popup(window.window_handle().window_id()) {
         window.remove_window();
         return false;
     }
 
     match hide_for_reuse(window) {
-        Ok(true) => true,
+        Ok(true) => {
+            crate::popup_window::end_reusable_popup_session(window, cx);
+            true
+        }
         Ok(false) => {
             window.remove_window();
             false

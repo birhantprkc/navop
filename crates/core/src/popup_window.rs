@@ -56,14 +56,58 @@ fn record_reusable_popup(
     content: WeakEntity<PopupWindowContent>,
 ) {
     if let Ok(mut slots) = reusable_popups().lock() {
-        slots.insert(key, ReusablePopup { handle, content });
+        // 同一个键重新登记只是刷新条目，不是新增窗口 —— 计数只在真的插入时增长，
+        // 否则「反复开关是否在新建窗口」就无法从计数上判断。
+        let is_new_window = slots
+            .insert(key, ReusablePopup { handle, content })
+            .is_none();
+        drop(slots);
+        if is_new_window {
+            crate::popup_lifecycle::record_window_registered();
+            crate::popup_lifecycle::log_lifecycle("popup_window_registered");
+        }
     }
 }
 
 fn forget_reusable_popup(key: &'static str) {
     if let Ok(mut slots) = reusable_popups().lock() {
-        slots.remove(key);
+        // 只有真的移除了条目才归还计数：窗口销毁与探活失败可能同时走到这里，
+        // 重复扣减会让 `live_windows` 变成负数。
+        let removed = slots.remove(key).is_some();
+        drop(slots);
+        if removed {
+            crate::popup_lifecycle::record_window_unregistered();
+            crate::popup_lifecycle::log_lifecycle("popup_window_unregistered");
+        }
     }
+}
+
+/// 原生窗口被销毁时清掉它的登记（非 macOS、隐藏失败回落、应用退出）。
+///
+/// 不清理的话条目会变成永不失效的脏数据，`live_windows` 只增不减。
+pub(crate) fn forget_reusable_popup_by_window(window_id: WindowId) {
+    let key = reusable_popups().lock().ok().and_then(|slots| {
+        slots
+            .iter()
+            .find(|(_, entry)| entry.handle.window_id() == window_id)
+            .map(|(key, _)| *key)
+    });
+
+    if let Some(key) = key {
+        forget_reusable_popup(key);
+    }
+}
+
+/// 这个窗口的内容实体；不是登记过的复用弹窗时返回 `None`。
+pub(crate) fn reusable_popup_content(
+    window_id: WindowId,
+) -> Option<WeakEntity<PopupWindowContent>> {
+    reusable_popups().lock().ok().and_then(|slots| {
+        slots
+            .values()
+            .find(|entry| entry.handle.window_id() == window_id)
+            .map(|entry| entry.content.clone())
+    })
 }
 
 /// 这个窗口是不是登记过的「关闭后复用」弹窗。
@@ -72,14 +116,35 @@ fn forget_reusable_popup(key: &'static str) {
 /// 否则「隐藏了一个永远不会被重新显示、也没人会去复用它的窗口」就只是白白泄漏 ——
 /// 一个视图层的关闭按钮改错了，不该变成内存泄漏。
 pub(crate) fn is_reusable_popup(window_id: WindowId) -> bool {
-    reusable_popups()
-        .lock()
-        .map(|slots| {
-            slots
-                .values()
-                .any(|entry| entry.handle.window_id() == window_id)
-        })
-        .unwrap_or(false)
+    reusable_popup_content(window_id).is_some()
+}
+
+/// 结束这个复用弹窗的**业务会话**：卸载业务 view，清掉焦点与通知。
+///
+/// 原生窗口不受影响（它已经被隐藏，等着复用）。「复用的是窗口，不是上一轮的业务状态」——
+/// 下一次打开会用新的 factory 重建 view，用的也是本次调用传入的入参。
+///
+/// 清理**同步**发生在关闭动作内部，不交给 `defer`：延后清理会有「刚重新打开的新会话
+/// 被上一轮的清理任务删掉」的时序问题，同步卸载则根本不存在这个窗口期。
+pub(crate) fn end_reusable_popup_session(window: &mut Window, cx: &mut App) {
+    let Some(content) = reusable_popup_content(window.window_handle().window_id()) else {
+        return;
+    };
+
+    // 先清窗口级状态：隐藏的窗口不再重绘，但焦点与通知层仍然持有旧会话的实体
+    // （输入状态、弹层闭包）。顺序上先清它们、再卸载业务 view 更安全。
+    window.blur(cx);
+    window.clear_notifications(cx);
+
+    if content
+        .update(cx, |content, cx| content.end_session(cx))
+        .is_err()
+    {
+        // 内容实体已经没了：会话随窗口一起销毁，计数由 `Drop for PopupWindowContent` 归还。
+        return;
+    }
+
+    crate::popup_lifecycle::log_lifecycle("popup_session_ended");
 }
 
 /// 该复用键的弹窗只是被隐藏（还活着）时：用 `factory` 重建它里面的 view，然后重新显示，
@@ -98,8 +163,8 @@ pub(crate) fn is_reusable_popup(window_id: WindowId) -> bool {
 /// 复用键永远命中不到 —— 也就白改了。
 fn install_reusable_popup_close_routes(window: &mut Window, cx: &mut App) {
     // ① 原生关闭（macOS 红点 / 平台层 close）。返回 false 表示「别关」，窗口已经被隐藏。
-    window.on_window_should_close(cx, |window, _cx| {
-        let _ = crate::window_close::close_window_for_reuse(window);
+    window.on_window_should_close(cx, |window, cx| {
+        let _ = crate::window_close::close_window_for_reuse(window, cx);
         false
     });
 
@@ -109,8 +174,8 @@ fn install_reusable_popup_close_routes(window: &mut Window, cx: &mut App) {
         window.window_handle(),
         |handle, cx| {
             cx.defer(move |cx| {
-                let _ = handle.update(cx, |_, window, _| {
-                    let _ = crate::window_close::close_window_for_reuse(window);
+                let _ = handle.update(cx, |_, window, cx| {
+                    let _ = crate::window_close::close_window_for_reuse(window, cx);
                 });
             });
         },
@@ -139,10 +204,7 @@ fn reshow_reusable_popup(
         let view = factory(window, cx);
         if content
             .update(cx, |content, cx| {
-                content.view = view;
-                content.title = title.clone();
-                content.hide_titlebar_when_fullscreen = options.hide_titlebar_when_fullscreen;
-                content.titlebar_revealed = false;
+                content.replace_session(view, title.clone(), options.hide_titlebar_when_fullscreen);
                 cx.notify();
             })
             .is_err()
@@ -150,6 +212,7 @@ fn reshow_reusable_popup(
             // 内容实体已经没了（窗口正在销毁），当作没命中。
             return false;
         }
+        crate::popup_lifecycle::log_lifecycle("popup_session_reopened");
 
         // 尺寸和标题都是调用方按本次参数给的，重新显示时要跟着回到本次的取值 ——
         // 窗口在上一轮里可能被 view 自己 resize 过（更新弹窗下载中就会）。
@@ -336,6 +399,12 @@ pub fn open_popup_window<F, E>(
 ///
 /// 关闭路径必须用 [`crate::window_close::close_window_for_reuse`] 代替
 /// `window.remove_window()`；否则窗口照样被销毁，复用键永远命中不到。
+///
+/// # 复用的是什么
+///
+/// 复用**原生窗口**，不复用业务会话：窗口关闭时会卸载业务 view（见
+/// [`end_reusable_popup_session`]），下次打开用本次 factory 重建。所以调用方不需要写
+/// 任何复位逻辑，也不要把「关闭后还能读回上次的输入」当成契约。
 pub fn open_reusable_popup_window<F, E>(
     options: PopupWindowOptions,
     reuse_key: &'static str,
@@ -470,11 +539,8 @@ fn open_popup_window_inner(
             crate::window_close::register_window(window.window_handle(), cx);
             let view: AnyView = factory(window, cx);
             let title = title.to_string();
-            let content = cx.new(|_| PopupWindowContent {
-                view,
-                title,
-                hide_titlebar_when_fullscreen: options.hide_titlebar_when_fullscreen,
-                titlebar_revealed: false,
+            let content = cx.new(|_| {
+                PopupWindowContent::new(view, title, options.hide_titlebar_when_fullscreen)
             });
             if let Some(key) = reuse_key {
                 record_reusable_popup(key, window.window_handle(), content.downgrade());
@@ -504,11 +570,65 @@ fn open_popup_window_inner(
     .detach();
 }
 
-struct PopupWindowContent {
-    view: AnyView,
+/// 一个复用弹窗的**内容实体**：它只做两件事 —— 渲染本次业务会话，以及在关闭时把它卸掉。
+///
+/// `view` 是 `Option` 而不是不可空字段：这是「关闭即结束会话」的落点。
+/// 关闭时把它置为 `None`，业务 view 连同它持有的数据、连接引用与任务句柄一起释放；
+/// 下次打开再用新的 factory 重建。窗口复用**不等于**会话复用。
+pub(crate) struct PopupWindowContent {
+    view: Option<AnyView>,
     title: String,
     hide_titlebar_when_fullscreen: bool,
     titlebar_revealed: bool,
+}
+
+impl PopupWindowContent {
+    fn new(view: AnyView, title: String, hide_titlebar_when_fullscreen: bool) -> Self {
+        crate::popup_lifecycle::record_session_opened();
+        Self {
+            view: Some(view),
+            title,
+            hide_titlebar_when_fullscreen,
+            titlebar_revealed: false,
+        }
+    }
+
+    /// 换上一次**新打开**的业务会话（复用窗口重新显示时传入本次 factory 重建的 view）。
+    ///
+    /// 旧会话还活着时它就在这里被替换掉，计数不变；否则记为一次新会话。
+    fn replace_session(
+        &mut self,
+        view: AnyView,
+        title: String,
+        hide_titlebar_when_fullscreen: bool,
+    ) {
+        if self.view.replace(view).is_none() {
+            crate::popup_lifecycle::record_session_opened();
+        }
+        self.title = title;
+        self.hide_titlebar_when_fullscreen = hide_titlebar_when_fullscreen;
+        self.titlebar_revealed = false;
+    }
+
+    /// 结束本次业务会话：卸载业务 view，回到「空闲窗口」状态。重复调用是安全的。
+    fn end_session(&mut self, cx: &mut Context<Self>) {
+        if self.view.take().is_none() {
+            return;
+        }
+        self.titlebar_revealed = false;
+        crate::popup_lifecycle::record_session_ended();
+        cx.notify();
+    }
+}
+
+impl Drop for PopupWindowContent {
+    fn drop(&mut self) {
+        // 窗口被真正销毁（非 macOS、隐藏失败回落、应用退出）时会话不经过关闭入口，
+        // 计数也要在这里归还，否则 `live_sessions` 只增不减。
+        if self.view.is_some() {
+            crate::popup_lifecycle::record_session_ended();
+        }
+    }
 }
 
 impl Render for PopupWindowContent {
@@ -536,7 +656,7 @@ impl Render for PopupWindowContent {
             .when(!auto_hide_titlebar, |this| {
                 this.child(render_popup_titlebar(self.title.clone()))
             })
-            .child(self.view.clone())
+            .children(self.view.clone())
             .children(sheet_layer)
             .children(dialog_layer)
             .children(notification_layer)
@@ -628,7 +748,7 @@ mod reuse_contract_tests {
         );
     }
 
-    /// 重新显示时用**本次调用**的 factory 重建 view。
+    /// 重新显示时用**本次调用**的 factory 重建 view（经由 `replace_session`）。
     ///
     /// 如果注册表把第一次的 factory（或 view）留下来了，第二次打开就会显示第一次的内容 ——
     /// 典型症状是「同一个导出窗口换了一张表，列还是旧表的」。这是复用最危险的退化方向，
@@ -648,8 +768,58 @@ mod reuse_contract_tests {
             "reshow_reusable_popup must take the factory of the *current* call"
         );
         assert!(
-            reshow.contains("content.view = view"),
+            reshow.contains("content.replace_session("),
             "reshow_reusable_popup must swap in the rebuilt view"
+        );
+    }
+
+    /// 「隐藏窗口」必须同时**结束业务会话**：卸载 view，并归还计数器。
+    ///
+    /// 只隐藏不卸载的话，上一次打开留下的 view（连同它持有的数据与任务句柄）会被内容树
+    /// 一直强引用着 —— 用户不再打开那类窗口时就是纯泄漏，而且注册表里的 `WeakEntity` 管不到它。
+    /// 这条链路断在任何一环都会静默退化：关闭动作不再调用卸载、卸载不再真的放开 view、
+    /// 或者计数器只加不减。
+    #[test]
+    fn closing_ends_the_business_session() {
+        let close = body(CLOSE_SOURCE, "pub fn close_window_for_reuse");
+        let hide = close
+            .find("hide_for_reuse(")
+            .expect("close_window_for_reuse must hide registered windows");
+        let end = close
+            .find("end_reusable_popup_session(")
+            .expect("closing must also end the business session, not just hide the window");
+        assert!(
+            hide < end,
+            "the session must only end after the window was actually hidden: a failed hide \
+             destroys the window, and its content entity returns the count on drop"
+        );
+
+        let content = body(POPUP_SOURCE, "struct PopupWindowContent");
+        assert!(
+            content.contains("view: Option<AnyView>"),
+            "PopupWindowContent.view must be Option: closing has to be able to unload it"
+        );
+
+        let end_session = body(POPUP_SOURCE, "fn end_session(&mut self");
+        assert!(
+            end_session.contains("self.view.take()"),
+            "end_session must release the business view instead of keeping it alive"
+        );
+
+        let release = body(POPUP_SOURCE, "fn end_reusable_popup_session");
+        assert!(
+            release.contains("content.end_session"),
+            "the close route must end the popup's business session"
+        );
+        assert!(
+            release.contains("window.blur(") && release.contains("clear_notifications("),
+            "the hidden window must also drop focus and notification state"
+        );
+
+        let drop_impl = body(POPUP_SOURCE, "impl Drop for PopupWindowContent");
+        assert!(
+            drop_impl.contains("record_session_ended"),
+            "destroying a window with a live session must return the count on drop"
         );
     }
 

@@ -112,7 +112,7 @@ impl UpdateDialogView {
         }
 
         if self.completed && self.info.is_local_simulation {
-            let _ = close_window_for_reuse(window);
+            let _ = close_window_for_reuse(window, cx);
             return;
         }
 
@@ -145,7 +145,7 @@ impl UpdateDialogView {
             return;
         }
 
-        let _ = close_window_for_reuse(window);
+        let _ = close_window_for_reuse(window, cx);
     }
 
     fn start_download(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -398,7 +398,7 @@ impl UpdateDialogView {
         AppSettings::update_and_save(cx, |settings| {
             settings.skipped_update_version = Some(latest_version);
         });
-        let _ = close_window_for_reuse(window);
+        let _ = close_window_for_reuse(window, cx);
     }
 
     fn status_message(&self) -> String {
