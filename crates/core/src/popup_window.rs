@@ -5,7 +5,8 @@ use gpui::{
     prelude::FluentBuilder, px, size,
 };
 use gpui_component::{
-    ActiveTheme, Root, TITLE_BAR_HEIGHT, TitleBar, WindowExt, notification::Notification, v_flex,
+    ActiveTheme, Root, TITLE_BAR_HEIGHT, TitleBar, WindowExt, notification::Notification,
+    render_dialog_layer, render_notification_layer, render_sheet_layer, v_flex,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -633,9 +634,9 @@ impl Drop for PopupWindowContent {
 
 impl Render for PopupWindowContent {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sheet_layer = Root::render_sheet_layer(window, cx);
-        let dialog_layer = Root::render_dialog_layer(window, cx);
-        let notification_layer = Root::render_notification_layer(window, cx);
+        let sheet_layer = render_sheet_layer(window, cx);
+        let dialog_layer = render_dialog_layer(window, cx);
+        let notification_layer = render_notification_layer(window, cx);
         let auto_hide_titlebar = self.hide_titlebar_when_fullscreen && window.is_fullscreen();
 
         v_flex()

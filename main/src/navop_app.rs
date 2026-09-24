@@ -16,6 +16,7 @@ use gpui_component::{
     dialog::{DialogButtonProps, DialogFooter},
     kbd::Kbd,
     notification::Notification,
+    render_dialog_layer, render_notification_layer, render_sheet_layer,
 };
 use one_core::gpui_tokio::{JoinError, Tokio};
 use one_core::keybindings::{action_id, rebind_keybindings, shortcuts_for};
@@ -2846,9 +2847,9 @@ mod tests {
 
 impl Render for NavopApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sheet_layer = Root::render_sheet_layer(window, cx);
-        let dialog_layer = Root::render_dialog_layer(window, cx);
-        let notification_layer = Root::render_notification_layer(window, cx);
+        let sheet_layer = render_sheet_layer(window, cx);
+        let dialog_layer = render_dialog_layer(window, cx);
+        let notification_layer = render_notification_layer(window, cx);
         let main_content = self.tab_container.clone();
         // 全局导航布局仍需要 TabContainer 的收起/展开按钮；其他主页布局不重复显示。
         // home 是 pinned tab，active_tab() 只查普通 tabs，必须用 pinned 通道判断。
