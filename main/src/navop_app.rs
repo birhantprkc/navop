@@ -364,7 +364,7 @@ fn initial_content_layout() -> InitialContentLayout {
 use gpui::px;
 
 use gpui_component::dock::ToggleZoom;
-use gpui_component::{ActiveTheme, Root};
+use gpui_component::ActiveTheme;
 use one_core::llm::manager::GlobalProviderState;
 use one_core::llm::notifier::emit_provider_config_changed;
 use one_core::llm::storage::{ProviderRepository, refresh_navop_models};
