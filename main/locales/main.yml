@@ -1999,6 +1999,10 @@ Connection:
       en: Automatic Public Key
       zh-CN: 自动公钥
       zh-HK: 自動公鑰
+    auth_password_and_private_key:
+      en: Password + Private Key
+      zh-CN: 密码 + 密钥
+      zh-HK: 密碼 + 金鑰
     mode_standalone:
       en: Standalone
       zh-CN: 单机
