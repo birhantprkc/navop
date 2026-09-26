@@ -953,6 +953,10 @@ Table:
     zh-HK: 匯入資料到表
 
   # 表设计器
+  loading_structure:
+    en: Loading table structure…
+    zh-CN: 正在加载表结构…
+    zh-HK: 正在載入表結構…
   table_name:
     en: Table Name
     zh-CN: 表名

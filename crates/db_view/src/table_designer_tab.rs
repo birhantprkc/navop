@@ -319,6 +319,7 @@ pub struct TableDesigner {
     ddl_preview_input: Entity<EditorState>,
     preview_refresh_state: PreviewRefreshScheduleState,
     metadata_load_seq: usize,
+    structure_load: StructureLoadState,
     preview_generation: usize,
     sql_preview_loading: bool,
     executing: bool,
@@ -365,6 +366,40 @@ impl PreviewRefreshScheduleState {
 
     fn finish_refresh(&mut self) {
         self.refresh_pending = false;
+    }
+}
+
+/// 表结构加载的触发来源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructureLoadReason {
+    /// 打开既有表设计器时的首次加载。
+    InitialOpen,
+    /// 保存成功后按最新结构重载。
+    AfterSave,
+}
+
+/// 表结构加载态。
+///
+/// 只有首次打开既有表时整块面板换成加载中，因为那时候列、索引、表信息都
+/// 还没回来，直接渲染表单就是一片空白；保存后的重载留在原地刷新，闪一下
+/// 反而更晕。
+#[derive(Default)]
+struct StructureLoadState {
+    loading: bool,
+}
+
+impl StructureLoadState {
+    fn begin(&mut self, reason: StructureLoadReason) {
+        self.loading = reason == StructureLoadReason::InitialOpen;
+    }
+
+    /// 加载结束（成功或失败都要调，否则面板会一直停在加载中）。
+    fn finish(&mut self) {
+        self.loading = false;
+    }
+
+    fn is_loading(&self) -> bool {
+        self.loading
     }
 }
 
@@ -547,6 +582,7 @@ impl TableDesigner {
             ddl_preview_input,
             preview_refresh_state: PreviewRefreshScheduleState::default(),
             metadata_load_seq: 0,
+            structure_load: StructureLoadState::default(),
             preview_generation: 0,
             sql_preview_loading: false,
             executing: false,
@@ -566,7 +602,7 @@ impl TableDesigner {
         designer.update_previews(window, cx);
 
         if designer.config.table_name.is_some() {
-            designer.load_table_structure("initial_open", cx);
+            designer.load_table_structure(StructureLoadReason::InitialOpen, cx);
         }
 
         designer
@@ -908,7 +944,10 @@ impl TableDesigner {
                                             designer.config.table_name =
                                                 Some(request.table_name.clone());
                                         }
-                                        designer.load_table_structure("after_save", cx);
+                                        designer.load_table_structure(
+                                            StructureLoadReason::AfterSave,
+                                            cx,
+                                        );
                                     }
                                     ExecuteSuccessBehavior::CloseTab {
                                         tab_container,
@@ -1120,17 +1159,19 @@ impl TableDesigner {
         self.build_and_maybe_execute(design, column_renames, success_behavior, window, cx);
     }
 
-    pub fn load_table_structure(&mut self, reason: &'static str, cx: &mut Context<Self>) {
+    fn load_table_structure(&mut self, reason: StructureLoadReason, cx: &mut Context<Self>) {
         let Some(table_name) = self.config.table_name.clone() else {
             return;
         };
 
         self.metadata_load_seq += 1;
         let load_seq = self.metadata_load_seq;
+        self.structure_load.begin(reason);
+        cx.notify();
         tracing::warn!(
             target: "table_designer_diag",
             seq = load_seq,
-            reason,
+            reason = ?reason,
             connection_id = %self.config.connection_id,
             database = %self.config.database_name,
             schema = ?self.config.schema_name,
@@ -1190,6 +1231,9 @@ impl TableDesigner {
                             error = %error,
                             "[table_designer_diag] load_table_structure Tokio task failed"
                         );
+                        let _ = this.update(cx, |designer, cx| {
+                            designer.finish_structure_load(cx);
+                        });
                         return;
                     }
                 };
@@ -1244,14 +1288,24 @@ impl TableDesigner {
                             );
                             designer.original_design = Some(original_design);
                             designer.update_previews(window, cx);
+                            designer.finish_structure_load(cx);
                         });
                     })
                 } else {
+                    let _ = this.update(cx, |designer, cx| {
+                        designer.finish_structure_load(cx);
+                    });
                     Err(anyhow::anyhow!("No active window"))
                 }
             });
         })
         .detach();
+    }
+
+    /// 收掉表结构加载态并刷新面板。
+    fn finish_structure_load(&mut self, cx: &mut Context<Self>) {
+        self.structure_load.finish();
+        cx.notify();
     }
 
     fn build_original_design(
@@ -1525,14 +1579,36 @@ impl Render for TableDesigner {
             .size_full()
             .child(self.render_toolbar(cx))
             .child(self.render_tabs(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .w_full()
-                    .overflow_hidden()
-                    .child(self.render_active_tab(window, cx)),
-            )
+            .child(div().flex_1().w_full().overflow_hidden().child(
+                if self.structure_load.is_loading() {
+                    render_structure_loading(cx)
+                } else {
+                    self.render_active_tab(window, cx)
+                },
+            ))
     }
+}
+
+/// 表结构加载面板的调试选择器（供回归测试定位该面板）。
+const STRUCTURE_LOADING_SELECTOR: &str = "table-designer-structure-loading";
+
+/// 首次打开既有表时，列/索引/表信息还在路上：先给一个明确的等待反馈，
+/// 而不是先渲染一个空白表单再被数据填上。
+fn render_structure_loading(cx: &App) -> AnyElement {
+    v_flex()
+        .debug_selector(|| STRUCTURE_LOADING_SELECTOR.to_owned())
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .child(Spinner::new().with_size(Size::Large))
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(t!("Table.loading_structure").to_string()),
+        )
+        .into_any_element()
 }
 
 impl EventEmitter<TableDesignerEvent> for TableDesigner {}
@@ -5081,5 +5157,106 @@ mod tests {
             None,
         );
         assert_eq!(found.and_then(|t| t.comment).as_deref(), Some("demo表"));
+    }
+
+    #[test]
+    fn initial_open_arms_the_structure_loading_panel() {
+        let mut state = StructureLoadState::default();
+
+        state.begin(StructureLoadReason::InitialOpen);
+
+        assert!(state.is_loading());
+    }
+
+    #[test]
+    fn after_save_reload_keeps_the_panel_in_place() {
+        let mut state = StructureLoadState::default();
+
+        state.begin(StructureLoadReason::AfterSave);
+
+        assert!(!state.is_loading());
+    }
+
+    #[test]
+    fn a_new_designer_starts_without_the_loading_panel() {
+        let state = StructureLoadState::default();
+
+        assert!(!state.is_loading());
+    }
+
+    #[test]
+    fn finishing_a_load_always_clears_the_loading_panel() {
+        let mut state = StructureLoadState::default();
+        state.begin(StructureLoadReason::InitialOpen);
+
+        state.finish();
+
+        assert!(!state.is_loading());
+    }
+
+    /// 打开既有表时真实面板会先停在加载态（列/索引/表信息回来前不渲染空表单）。
+    #[gpui::test]
+    fn opening_an_existing_table_arms_the_loading_panel(cx: &mut gpui::TestAppContext) {
+        let (existing, _visual) = designer_window(cx, Some("users"));
+
+        assert!(existing.read_with(cx, |designer, _| designer.structure_load.is_loading()));
+    }
+
+    /// 新建表没有可拉取的结构，不应该出现加载态。
+    #[gpui::test]
+    fn opening_a_new_table_keeps_the_form_visible(cx: &mut gpui::TestAppContext) {
+        let (new_table, _visual) = designer_window(cx, None);
+
+        assert!(!new_table.read_with(cx, |designer, _| designer.structure_load.is_loading()));
+    }
+
+    /// 加载期间面板是加载中占位，而不是一片空白表单；加载结束后回到表单。
+    ///
+    /// 直接驱动加载态（不触发真实查询）：这里要验证的是渲染门控，
+    /// 触发时机由 `opening_an_existing_table_arms_the_loading_panel` 负责。
+    #[gpui::test]
+    fn existing_table_renders_the_loading_panel_until_the_structure_arrives(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (designer, visual) = designer_window(cx, None);
+
+        visual.update(|_window, cx| {
+            designer.update(cx, |designer, cx| {
+                designer
+                    .structure_load
+                    .begin(StructureLoadReason::InitialOpen);
+                cx.notify();
+            });
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(visual.debug_bounds(STRUCTURE_LOADING_SELECTOR).is_some());
+
+        visual.update(|_window, cx| {
+            designer.update(cx, |designer, cx| designer.finish_structure_load(cx));
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(visual.debug_bounds(STRUCTURE_LOADING_SELECTOR).is_none());
+    }
+
+    fn designer_window<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        table_name: Option<&str>,
+    ) -> (Entity<TableDesigner>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            one_core::gpui_tokio::init(cx);
+            cx.set_global(GlobalDbState::default());
+        });
+
+        let mut config = TableDesignerConfig::new("conn-1", "app", DatabaseType::MySQL);
+        if let Some(table_name) = table_name {
+            config = config.with_table_name(table_name);
+        }
+
+        cx.add_window_view(move |window, cx| TableDesigner::new("表设计器", config, window, cx))
     }
 }
