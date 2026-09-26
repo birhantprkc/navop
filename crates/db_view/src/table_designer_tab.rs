@@ -3652,6 +3652,7 @@ mod tests {
         clickhouse::ClickHousePlugin, mssql::MsSqlPlugin, mysql::MySqlPlugin, oracle::OraclePlugin,
         plugin::DatabasePlugin, postgresql::PostgresPlugin, sqlite::SqlitePlugin,
     };
+    use std::{cell::Cell, rc::Rc};
 
     /// 表设计器 DDL 断言仅覆盖仍带原生插件的数据库类型。
     ///
@@ -5197,17 +5198,17 @@ mod tests {
     /// 打开既有表时真实面板会先停在加载态（列/索引/表信息回来前不渲染空表单）。
     #[gpui::test]
     fn opening_an_existing_table_arms_the_loading_panel(cx: &mut gpui::TestAppContext) {
-        let (existing, _visual) = designer_window(cx, Some("users"));
+        let (_designer, armed_at_open, _visual) = designer_window(cx, Some("users"));
 
-        assert!(existing.read_with(cx, |designer, _| designer.structure_load.is_loading()));
+        assert!(armed_at_open);
     }
 
     /// 新建表没有可拉取的结构，不应该出现加载态。
     #[gpui::test]
     fn opening_a_new_table_keeps_the_form_visible(cx: &mut gpui::TestAppContext) {
-        let (new_table, _visual) = designer_window(cx, None);
+        let (_designer, armed_at_open, _visual) = designer_window(cx, None);
 
-        assert!(!new_table.read_with(cx, |designer, _| designer.structure_load.is_loading()));
+        assert!(!armed_at_open);
     }
 
     /// 加载期间面板是加载中占位，而不是一片空白表单；加载结束后回到表单。
@@ -5218,7 +5219,7 @@ mod tests {
     fn existing_table_renders_the_loading_panel_until_the_structure_arrives(
         cx: &mut gpui::TestAppContext,
     ) {
-        let (designer, visual) = designer_window(cx, None);
+        let (designer, _armed_at_open, visual) = designer_window(cx, None);
 
         visual.update(|_window, cx| {
             designer.update(cx, |designer, cx| {
@@ -5242,10 +5243,14 @@ mod tests {
         assert!(visual.debug_bounds(STRUCTURE_LOADING_SELECTOR).is_none());
     }
 
+    /// 构造表设计器窗口，返回 (designer, 打开瞬间是否在加载态, visual)。
+    ///
+    /// 加载态在构造处当场采样：结构查询是异步的，回过头再读字段就会和「查询已经
+    /// 失败并收掉加载态」赛跑，采样点必须在同一个不中断的闭包内。
     fn designer_window<'a>(
         cx: &'a mut gpui::TestAppContext,
         table_name: Option<&str>,
-    ) -> (Entity<TableDesigner>, &'a mut gpui::VisualTestContext) {
+    ) -> (Entity<TableDesigner>, bool, &'a mut gpui::VisualTestContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
             one_core::gpui_tokio::init(cx);
@@ -5257,6 +5262,14 @@ mod tests {
             config = config.with_table_name(table_name);
         }
 
-        cx.add_window_view(move |window, cx| TableDesigner::new("表设计器", config, window, cx))
+        let armed_at_open = Rc::new(Cell::new(false));
+        let probe = armed_at_open.clone();
+        let (designer, visual) = cx.add_window_view(move |window, cx| {
+            let designer = TableDesigner::new("表设计器", config, window, cx);
+            probe.set(designer.structure_load.is_loading());
+            designer
+        });
+
+        (designer, armed_at_open.get(), visual)
     }
 }
