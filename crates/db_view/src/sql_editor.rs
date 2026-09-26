@@ -3,6 +3,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::sql_editor_definition::DefaultSqlDefinitionProvider;
 use crate::sql_editor_hover::DefaultSqlHoverProvider;
 use crate::sql_editor_signature::DefaultSqlSignatureHelpProvider;
 use anyhow::Result;
@@ -20,15 +21,15 @@ use gpui::{
     App, AppContext, Context, Entity, Font, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Task, Window, div,
 };
+use gpui_component::WindowExt as _;
 use gpui_component::highlighter::{Diagnostic, DiagnosticSeverity};
 use gpui_component::input::{
-    CodeActionProvider, CompletionProvider, Copy, Cut, EditorState, GutterLane, GutterLaneOptions,
-    GutterMarker, HoverProvider, Paste, SelectAll, TabSize,
+    CodeActionProvider, CompletionProvider, Copy, Cut, DefinitionProvider, EditorState, GutterLane,
+    GutterLaneOptions, GutterMarker, HoverProvider, Paste, SelectAll, ShowDocumentHandler, TabSize,
 };
 use gpui_component::native_menu::NativeMenu as PlatformNativeMenu;
 use gpui_component::spinner::Spinner;
 use gpui_component::tooltip::Tooltip;
-use gpui_component::WindowExt as _;
 use gpui_component::{Icon, Rope, RopeExt, Sizable as _, Size};
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
@@ -41,7 +42,15 @@ use one_ui::{ExtendedEditor, ExtendedEditorState, SignatureHelpProvider};
 use rust_i18n::t;
 use sum_tree::Bias;
 
-gpui::actions!(sql_editor, [RunSelectedSql, RunCursorStatementSql, ShowHoverDetails, CopyHoverDdl]);
+gpui::actions!(
+    sql_editor,
+    [
+        RunSelectedSql,
+        RunCursorStatementSql,
+        ShowHoverDetails,
+        CopyHoverDdl
+    ]
+);
 
 pub(crate) const SQL_GUTTER_IDLE: &str = "idle";
 pub(crate) const SQL_GUTTER_RUNNING: &str = "running";
@@ -2442,6 +2451,15 @@ impl SqlEditor {
         let default_provider_trait: Rc<dyn CompletionProvider> =
             default_completion_provider.clone();
         let default_hover_provider = Rc::new(DefaultSqlHoverProvider::new(SqlSchema::default()));
+        // Cmd/Ctrl+click reuses the same schema snapshot as the hover
+        // provider; gpui-kit underlines the identifier on Cmd/Ctrl+hover and
+        // hands the click over to `show_document` (see the handler below).
+        let default_definition_provider = Rc::new(DefaultSqlDefinitionProvider::new(
+            default_hover_provider.sources_handle(),
+        ));
+        let default_definition_provider_trait: Rc<dyn DefinitionProvider> =
+            default_definition_provider.clone();
+        let show_object_details = sql_object_details_handler(default_definition_provider.clone());
         let default_signature_help_provider =
             Rc::new(DefaultSqlSignatureHelpProvider::new(SqlSchema::default()));
         let default_signature_help_provider_trait: Rc<dyn SignatureHelpProvider> =
@@ -2460,6 +2478,8 @@ impl SqlEditor {
                 .placeholder(t!("Query.editor_placeholder").to_string());
 
             editor.lsp_mut().completion_provider = Some(default_provider_trait);
+            editor.lsp_mut().definition_provider = Some(default_definition_provider_trait);
+            editor.lsp_mut().show_document = Some(show_object_details);
             // The default hover provider is intentionally NOT installed as a
             // mouse-hover trigger: hover details are shown on demand from the
             // context menu (ShowHoverDetails) instead, so pointer movement
@@ -2777,13 +2797,10 @@ impl SqlEditor {
                 Some(state.selected_range()),
             )
         });
-        let Some(hover) =
-            crate::sql_editor_hover::build_lsp_hover_for_selection(&text, selection, cursor, &schema)
-        else {
-            window.push_notification(
-                t!("Query.no_hover_details_at_cursor").to_string(),
-                cx,
-            );
+        let Some(hover) = crate::sql_editor_hover::build_lsp_hover_for_selection(
+            &text, selection, cursor, &schema,
+        ) else {
+            window.push_notification(t!("Query.no_hover_details_at_cursor").to_string(), cx);
             return;
         };
         let markdown = match &hover.contents {
@@ -2810,10 +2827,7 @@ impl SqlEditor {
                 window.push_notification(t!("Query.ddl_copied").to_string(), cx);
             }
             None => {
-                window.push_notification(
-                    t!("Query.no_hover_details_at_cursor").to_string(),
-                    cx,
-                );
+                window.push_notification(t!("Query.no_hover_details_at_cursor").to_string(), cx);
             }
         }
     }
@@ -2874,24 +2888,24 @@ impl Render for SqlEditor {
                 // Never touch a custom provider installed via set_hover_provider.
                 if hover_enabled != default_installed {
                     state.clear_hover_state(cx);
-                    state.lsp_mut().hover_provider =
-                        hover_enabled.then(|| default_trait);
+                    state.lsp_mut().hover_provider = hover_enabled.then(|| default_trait);
                 }
             });
         }
-        div().size_full()
+        div()
+            .size_full()
             .on_action(cx.listener(Self::handle_show_hover_details_action))
             .on_action(cx.listener(Self::handle_copy_hover_ddl_action))
             .child(
-            ExtendedEditor::new(&self.extended_editor)
-                .context_menu(move |_, _, cx| {
-                    sql_editor_native_menu(capabilities, cx.read_from_clipboard().is_some())
-                })
-                .font(font)
-                .text_size(gpui::px(font_size))
-                .line_height(gpui::px(font_size * 1.5))
-                .size_full(),
-        )
+                ExtendedEditor::new(&self.extended_editor)
+                    .context_menu(move |_, _, cx| {
+                        sql_editor_native_menu(capabilities, cx.read_from_clipboard().is_some())
+                    })
+                    .font(font)
+                    .text_size(gpui::px(font_size))
+                    .line_height(gpui::px(font_size * 1.5))
+                    .size_full(),
+            )
     }
 }
 
@@ -2912,13 +2926,30 @@ impl Render for SqlHoverDetailsView {
             .p_3()
             .overflow_y_scroll()
             .child(
-                gpui_base::TextView::markdown(
-                    "sql-hover-details-markdown",
-                    self.markdown.clone(),
-                )
-                .selectable(true),
+                gpui_base::TextView::markdown("sql-hover-details-markdown", self.markdown.clone())
+                    .selectable(true),
             )
     }
+}
+
+/// `show_document` callback backing Cmd/Ctrl+click on an identifier.
+///
+/// gpui-kit offers the go-to-definition target here before falling back to its
+/// own handling. We claim only our synthetic URI (see
+/// [`crate::sql_editor_definition`]) and open the same details window the
+/// context menu uses; anything else returns `false` so normal go-to-definition
+/// behaviour is untouched.
+fn sql_object_details_handler(provider: Rc<DefaultSqlDefinitionProvider>) -> ShowDocumentHandler {
+    Rc::new(move |params, window, cx| {
+        if !crate::sql_editor_definition::is_object_details_uri(&params.uri) {
+            return false;
+        }
+        let Some(details) = provider.take_pending_details() else {
+            return false;
+        };
+        open_sql_hover_details_window(details.markdown, window, cx);
+        true
+    })
 }
 
 fn open_sql_hover_details_window(markdown: String, window: &mut Window, cx: &mut App) {
@@ -3036,7 +3067,7 @@ fn render_sql_gutter_marker(marker: &GutterMarker) -> gpui::AnyElement {
 #[cfg(test)]
 mod tests {
     use super::{
-        RunCursorStatementSql, RunSelectedSql, ShowHoverDetails, SQL_GUTTER_IDLE, SqlContext,
+        RunCursorStatementSql, RunSelectedSql, SQL_GUTTER_IDLE, ShowHoverDetails, SqlContext,
         SqlEditor, SqlSchema, analyze_diagnostics_pure, completion_priority, identifier_match_rank,
         schema_to_metadata_view, sql_diagnostic_to_input, sql_editor_context_menu,
     };
@@ -3053,7 +3084,7 @@ mod tests {
         Copy, Cut, GutterMarker, InlineWidget, InputEvent, Paste, RangeDecoration, SelectAll,
     };
     use gpui_component::{Rope, RopeExt};
-    use lsp_types::CompletionItemKind;
+    use lsp_types::{CompletionItemKind, ShowDocumentParams};
     use one_core::settings::AppSettings;
     use std::collections::HashMap;
     use std::{cell::RefCell, rc::Rc, sync::Arc};
@@ -3148,9 +3179,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn sql_editor_installs_mouse_hover_provider_only_when_enabled(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn sql_editor_installs_mouse_hover_provider_only_when_enabled(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
             cx.set_global(AppSettings::default());
@@ -3192,6 +3221,204 @@ mod tests {
                 "enabling the setting installs the default hover provider"
             );
         });
+    }
+
+    /// Metadata for the SQL snippets used by the Cmd/Ctrl+click tests.
+    fn users_schema() -> SqlSchema {
+        SqlSchema::default()
+            .with_scope(Some("app".into()), Some("public".into()))
+            .with_tables(vec![("users".to_string(), "doc".to_string())])
+            .with_table_detail(
+                "users",
+                crate::sql_editor::SqlTableDetail {
+                    object_type: crate::sql_editor::SqlObjectType::Table,
+                    schema: Some("public".into()),
+                    comment: None,
+                    engine: None,
+                    columns: vec![crate::sql_editor::SqlColumnDetail {
+                        name: "id".into(),
+                        data_type: "INT".into(),
+                        is_nullable: false,
+                        is_primary_key: true,
+                        default_value: None,
+                        comment: None,
+                    }],
+                },
+            )
+    }
+
+    /// Builds a window hosting a SQL editor showing `select * from users`
+    /// against [`users_schema`], and returns the byte range of `users`.
+    fn editor_over_users_table(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<SqlEditor>,
+        &mut VisualTestContext,
+        std::ops::Range<usize>,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(AppSettings::default());
+        });
+        let text = "select * from users";
+        let table_range = text.find("users").expect("table name")..text.len();
+        let mut sql_editor = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| SqlEditor::new(window, cx));
+            sql_editor = Some(editor.clone());
+            SqlEditorHarness {
+                editor,
+                _subscription: None,
+            }
+        });
+        let sql_editor = sql_editor.expect("SQL editor should be created");
+        VisualTestContext::update(visual, |window, cx| {
+            sql_editor.update(cx, |editor, cx| {
+                editor.set_schema(users_schema(), window, cx);
+                editor.set_value(text.to_string(), window, cx);
+            });
+            // Layout the editor so identifier bounds are known to the mouse
+            // simulation below.
+            window.draw(cx).clear(cx);
+        });
+        (sql_editor, visual, table_range)
+    }
+
+    /// Window-space center of `range` in the editor's text.
+    fn text_range_center(
+        visual: &mut VisualTestContext,
+        sql_editor: &Entity<SqlEditor>,
+        range: &std::ops::Range<usize>,
+    ) -> gpui::Point<gpui::Pixels> {
+        visual
+            .read(|cx| {
+                sql_editor
+                    .read(cx)
+                    .input()
+                    .read(cx)
+                    .range_to_bounds(range)
+                    .map(|bounds| bounds.center())
+            })
+            .expect("the table name should be laid out")
+    }
+
+    /// Pumps the dispatcher (foreground tasks included): the definition
+    /// lookup completes in a spawned task, so `run_until_parked` alone is not
+    /// enough before clicking.
+    fn settle(visual: &mut VisualTestContext) {
+        visual.cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn sql_editor_installs_object_details_definition_provider(cx: &mut gpui::TestAppContext) {
+        let (sql_editor, visual, _) = editor_over_users_table(cx);
+
+        // Cmd/Ctrl+click is the primary entry point for object details, so the
+        // provider and the host handler are installed unconditionally - unlike
+        // the mouse-hover popover, which stays opt-in via settings.
+        visual.read(|cx| {
+            let input = sql_editor.read(cx).input();
+            let lsp = input.read(cx).lsp();
+            assert!(
+                lsp.definition_provider.is_some(),
+                "Cmd/Ctrl+click needs a definition provider"
+            );
+            assert!(
+                lsp.show_document.is_some(),
+                "the host must intercept the synthetic details URI"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn sql_editor_secondary_click_opens_object_details_window(cx: &mut gpui::TestAppContext) {
+        let (sql_editor, visual, table_range) = editor_over_users_table(cx);
+        let point = text_range_center(visual, &sql_editor, &table_range);
+
+        // Cmd/Ctrl+hover first: gpui-kit only offers an identifier to the
+        // definition provider while the secondary modifier is held.
+        visual.simulate_mouse_move(
+            point,
+            Option::<MouseButton>::None,
+            Modifiers::secondary_key(),
+        );
+        settle(visual);
+
+        let windows_before = visual.read(|cx| cx.windows().len());
+        visual.simulate_mouse_down(point, MouseButton::Left, Modifiers::secondary_key());
+        settle(visual);
+        visual.read(|cx| {
+            assert_eq!(
+                windows_before + 1,
+                cx.windows().len(),
+                "Cmd/Ctrl+click on a table must open the object details window"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn sql_editor_plain_click_on_table_keeps_normal_editing(cx: &mut gpui::TestAppContext) {
+        let (sql_editor, visual, table_range) = editor_over_users_table(cx);
+        let point = text_range_center(visual, &sql_editor, &table_range);
+
+        // Cmd/Ctrl+hover arms the link, but a plain click must only move the
+        // caret - opening details on every click would be unusable.
+        visual.simulate_mouse_move(
+            point,
+            Option::<MouseButton>::None,
+            Modifiers::secondary_key(),
+        );
+        settle(visual);
+
+        let windows_before = visual.read(|cx| cx.windows().len());
+        visual.simulate_click(point, Modifiers::default());
+        settle(visual);
+        visual.read(|cx| {
+            assert_eq!(
+                windows_before,
+                cx.windows().len(),
+                "a plain click must not open the details window"
+            );
+            assert_eq!(
+                table_range.start + table_range.len() / 2,
+                sql_editor.read(cx).input().read(cx).cursor(),
+                "a plain click must still place the caret"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn sql_object_details_handler_keeps_foreign_documents_to_the_kit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (sql_editor, visual, _) = editor_over_users_table(cx);
+        let handler = visual
+            .read(|cx| {
+                sql_editor
+                    .read(cx)
+                    .input()
+                    .read(cx)
+                    .lsp()
+                    .show_document
+                    .clone()
+            })
+            .expect("host handler should be installed");
+        let windows_before = visual.read(|cx| cx.windows().len());
+
+        // A regular go-to-definition target (a real file) must fall through to
+        // gpui-kit's own handling instead of opening the details window.
+        let handled = visual.update(|window, cx| {
+            let params = ShowDocumentParams {
+                uri: "file:///tmp/query.sql".parse().expect("valid uri"),
+                external: Some(false),
+                take_focus: Some(true),
+                selection: None,
+            };
+            handler(&params, window, cx)
+        });
+
+        assert!(!handled, "only the synthetic details URI belongs to us");
+        visual.read(|cx| assert_eq!(windows_before, cx.windows().len()));
     }
 
     #[gpui::test]
@@ -3265,10 +3492,7 @@ mod tests {
                 )
             };
             let hover = crate::sql_editor_hover::build_lsp_hover_for_selection(
-                &text,
-                selection,
-                cursor,
-                &schema,
+                &text, selection, cursor, &schema,
             )
             .expect("selection-aware hover should resolve the selected table");
             let markdown = match &hover.contents {
@@ -3303,13 +3527,8 @@ mod tests {
                 },
             );
         let text = "select * from users";
-        let ddl = crate::sql_editor_hover::build_ddl_for_selection(
-            text,
-            None,
-            text.len(),
-            &schema,
-        )
-        .expect("table hover carries a DDL preview");
+        let ddl = crate::sql_editor_hover::build_ddl_for_selection(text, None, text.len(), &schema)
+            .expect("table hover carries a DDL preview");
         assert!(ddl.starts_with("CREATE TABLE"));
         assert!(ddl.contains("id INT"));
         assert!(!ddl.contains("```"));

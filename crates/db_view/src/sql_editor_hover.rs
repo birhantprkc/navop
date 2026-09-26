@@ -9,8 +9,8 @@
 use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use db::sql_editor::sql_tokenizer::{SqlTokenKind, SqlTokenizer};
@@ -105,6 +105,12 @@ impl DefaultSqlHoverProvider {
     pub(crate) fn snapshot(&self) -> SqlHoverSources {
         self.sources.borrow().clone()
     }
+
+    /// Shared schema snapshot, so other providers (Cmd/Ctrl+click definition)
+    /// see exactly the same metadata generation.
+    pub(crate) fn sources_handle(&self) -> Rc<RefCell<SqlHoverSources>> {
+        self.sources.clone()
+    }
 }
 
 impl HoverProvider for DefaultSqlHoverProvider {
@@ -136,19 +142,45 @@ impl HoverProvider for DefaultSqlHoverProvider {
     }
 }
 
+/// A resolved object: its details markdown plus the byte range of the source
+/// identifier it was resolved from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlObjectDetails {
+    /// Markdown body shared with the hover popover and the details window.
+    pub markdown: String,
+    /// Byte range of the whole (possibly qualified) identifier.
+    pub range: Range<usize>,
+}
+
 /// Full hover pipeline: locate identifier -> resolve -> render markdown.
 pub fn build_lsp_hover(text: &str, offset: usize, schema: &SqlSchema) -> Option<LspHover> {
-    let ident = locate_identifier(text, offset)?;
-    let object = resolve_hover(schema, &ident)?;
-    let (markdown, _ddl_is_fallback) = build_hover(&object);
-    let start = offset_to_lsp_position(text, ident.range.start);
-    let end = offset_to_lsp_position(text, ident.range.end);
+    let details = resolve_object_details(text, offset, schema)?;
+    let start = offset_to_lsp_position(text, details.range.start);
+    let end = offset_to_lsp_position(text, details.range.end);
     Some(LspHover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: markdown,
+            value: details.markdown,
         }),
         range: Some(LspRange::new(start, end)),
+    })
+}
+
+/// Render the object under `offset` (or nothing when it is not a known
+/// table/column/function). Shared by the hover popover and the
+/// Cmd/Ctrl+click definition provider, so both must agree on what counts as
+/// a hit.
+pub fn resolve_object_details(
+    text: &str,
+    offset: usize,
+    schema: &SqlSchema,
+) -> Option<SqlObjectDetails> {
+    let ident = locate_identifier(text, offset)?;
+    let object = resolve_hover(schema, &ident)?;
+    let (markdown, _ddl_is_fallback) = build_hover(&object);
+    Some(SqlObjectDetails {
+        markdown,
+        range: ident.range,
     })
 }
 
@@ -613,7 +645,7 @@ fn escape_md(value: &str) -> String {
 }
 
 /// Convert a byte offset to an LSP position (line, character-in-chars).
-fn offset_to_lsp_position(text: &str, offset: usize) -> LspPosition {
+pub(crate) fn offset_to_lsp_position(text: &str, offset: usize) -> LspPosition {
     let offset = clip_utf8_offset_left(text, offset);
     let before = &text[..offset];
     let line = before.matches('\n').count();
