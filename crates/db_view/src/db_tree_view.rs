@@ -539,6 +539,65 @@ fn object_icon(name: IconName) -> Icon {
 // DbTreeView - 数据库连接树视图（支持懒加载）
 // ============================================================================
 
+/// 搜索期间的分支展开记忆。
+///
+/// 搜索命中子节点的分支会自动展开（否则用户看不到命中的下级对象），
+/// 但用户仍然可以手动把它们收起来。本结构记住这类手动收起，
+/// 直到搜索词变化或用户重新展开为止。
+#[derive(Default)]
+struct SearchExpansionState {
+    /// 用户在本轮搜索里手动收起的节点。
+    collapsed: HashSet<String>,
+    /// 本轮搜索实际展开过的分支，用于渲染时判断箭头方向与图标。
+    expanded: HashSet<String>,
+}
+
+impl SearchExpansionState {
+    /// 搜索结果中 `node_id` 分支是否展开子节点。
+    fn should_expand_branch(&self, node_id: &str, has_matching_children: bool) -> bool {
+        has_matching_children && !self.collapsed.contains(node_id)
+    }
+
+    /// 记录本次展平中实际展开的分支。
+    fn mark_expanded(&mut self, node_id: &str) {
+        self.expanded.insert(node_id.to_string());
+    }
+
+    /// 该分支是否正在以展开状态显示。
+    fn is_expanded(&self, node_id: &str) -> bool {
+        self.expanded.contains(node_id)
+    }
+
+    /// 用户是否在本轮搜索里手动收起过该分支。
+    fn is_collapsed_by_user(&self, node_id: &str) -> bool {
+        self.collapsed.contains(node_id)
+    }
+
+    /// 记录用户在本轮搜索里的展开/收起动作。
+    fn record_toggle(&mut self, node_id: &str, collapsed: bool) {
+        if collapsed {
+            self.collapsed.insert(node_id.to_string());
+        } else {
+            self.collapsed.remove(node_id);
+        }
+    }
+
+    /// 把当前所有自动展开的分支记为手动收起（用于「折叠全部」）。
+    fn collapse_all_expanded(&mut self) {
+        self.collapsed.extend(self.expanded.iter().cloned());
+    }
+
+    /// 新搜索词：忘掉上一轮的收起记忆，命中的分支重新展开。
+    fn reset_for_new_query(&mut self) {
+        self.collapsed.clear();
+    }
+
+    /// 重新展平列表前清空「本轮实际展开」的记录。
+    fn clear_expanded_branches(&mut self) {
+        self.expanded.clear();
+    }
+}
+
 pub struct DbTreeView {
     focus_handle: FocusHandle,
     // 扁平化的树条目
@@ -557,6 +616,8 @@ pub struct DbTreeView {
     error_nodes: HashMap<String, String>,
     // 已展开的节点（用于在重建树时保持展开状态）
     expanded_nodes: HashSet<String>,
+    // 搜索期间的分支展开记忆（命中的分支默认展开，用户手动收起后保持收起）
+    search_expansion: SearchExpansionState,
     // 当前连接名称或者工作区名称
     connection_name: Option<String>,
     // 工作区ID
@@ -789,8 +850,7 @@ impl DbTreeView {
                         if debouncer.debounce(cx).await {
                             _ = view.update(cx, |this, cx| {
                                 if this.search_seq == current_seq {
-                                    this.search_query = query_for_task.clone();
-                                    this.rebuild_flat_entries(cx);
+                                    this.apply_search_query(query_for_task.clone(), cx);
                                 }
                             });
                         }
@@ -822,6 +882,7 @@ impl DbTreeView {
             loading_nodes: HashSet::new(),
             error_nodes: HashMap::new(),
             expanded_nodes: HashSet::new(),
+            search_expansion: SearchExpansionState::default(),
             connection_name: None,
             workspace_id,
             search_input,
@@ -1095,6 +1156,11 @@ impl DbTreeView {
     /// 折叠所有节点
     pub fn collapse_all(&mut self, cx: &mut Context<Self>) {
         self.expanded_nodes.clear();
+        // 搜索命中的分支是自动展开的：折叠全部时也要把它们收起来，
+        // 否则列表看上去毫无变化。
+        if !self.search_query.is_empty() {
+            self.search_expansion.collapse_all_expanded();
+        }
         self.rebuild_flat_entries(cx);
     }
 
@@ -1779,6 +1845,7 @@ impl DbTreeView {
     pub fn rebuild_flat_entries(&mut self, cx: &mut Context<Self>) {
         self.flat_entries.clear();
         self.selected_ix = None;
+        self.search_expansion.clear_expanded_branches();
 
         // 获取根节点并排序
         let mut root_nodes: Vec<DbNode> = self
@@ -1868,11 +1935,18 @@ impl DbTreeView {
             depth,
         });
 
-        // 如果展开或者搜索匹配到子节点，添加子节点
-        let should_show_children = if !query.is_empty() {
-            has_matching_children
-        } else {
+        // 搜索期间命中的分支自动展开（用户手动收起过则保持收起），
+        // 非搜索期间沿用持久展开状态。
+        let should_show_children = if query.is_empty() {
             self.expanded_nodes.contains(node_id)
+        } else {
+            let expanded = self
+                .search_expansion
+                .should_expand_branch(node_id, has_matching_children);
+            if expanded {
+                self.search_expansion.mark_expanded(node_id);
+            }
+            expanded
         };
 
         if should_show_children {
@@ -1982,8 +2056,49 @@ impl DbTreeView {
         false
     }
 
+    /// 应用新的搜索词（搜索框防抖后调用）。
+    ///
+    /// 搜索词变化时一并丢弃上一轮搜索里的手动收起记忆，
+    /// 让新命中的分支重新展开。
+    fn apply_search_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if query.to_lowercase() != self.search_query.to_lowercase() {
+            self.search_expansion.reset_for_new_query();
+        }
+        self.search_query = query;
+        self.rebuild_flat_entries(cx);
+    }
+
     /// 保持向后兼容的方法别名
     pub fn rebuild_tree(&mut self, cx: &mut Context<Self>) {
+        self.rebuild_flat_entries(cx);
+    }
+
+    /// 节点当前是否呈现为展开：持久展开状态，或搜索命中带来的自动展开
+    /// （搜索期间用户手动收起过则优先）。
+    fn is_node_expanded(&self, node_id: &str) -> bool {
+        if self.search_expansion.is_collapsed_by_user(node_id) {
+            return false;
+        }
+        self.expanded_nodes.contains(node_id)
+            || (!self.search_query.is_empty() && self.search_expansion.is_expanded(node_id))
+    }
+
+    /// 切换节点的展开状态。
+    ///
+    /// 搜索期间命中的分支是自动展开的，这里同时记下用户的手动意愿，
+    /// 否则重建列表后它们又会被自动展开。
+    fn toggle_node_expansion(&mut self, node_id: &str, cx: &mut Context<Self>) {
+        let expanded = self.is_node_expanded(node_id);
+        if expanded {
+            self.expanded_nodes.remove(node_id);
+        } else {
+            self.expanded_nodes.insert(node_id.to_string());
+            self.lazy_load_children(node_id.to_string(), cx);
+        }
+        if !self.search_query.is_empty() {
+            // 切换前是展开状态，就意味着这次操作是「收起」。
+            self.search_expansion.record_toggle(node_id, expanded);
+        }
         self.rebuild_flat_entries(cx);
     }
 
@@ -2213,21 +2328,7 @@ impl DbTreeView {
                 | DbNodeType::TablesFolder
                 | DbNodeType::ViewsFolder
                 | DbNodeType::MaterializedViewsFolder => {
-                    let is_expanded = self.expanded_nodes.contains(node_id);
-
-                    // 切换展开状态
-                    if is_expanded {
-                        self.expanded_nodes.remove(node_id);
-                    } else {
-                        self.expanded_nodes.insert(node_id.to_string());
-                    }
-
-                    // 如果是展开操作，加载子节点（如果尚未加载）
-                    if !is_expanded {
-                        self.lazy_load_children(node_id.to_string(), cx);
-                    }
-                    // 无论展开还是折叠，都需要重建树以更新展开状态
-                    self.rebuild_tree(cx);
+                    self.toggle_node_expansion(node_id, cx);
                 }
                 _ => {
                     // 其他类型的节点暂不处理双击
@@ -2679,7 +2780,7 @@ impl DbTreeView {
 
         // 获取节点信息
         let node = self.db_nodes.get(&node_id).cloned();
-        let is_expanded = self.expanded_nodes.contains(&node_id);
+        let is_expanded = self.is_node_expanded(&node_id);
         let is_loading = self.loading_nodes.contains(&node_id);
         let error_msg = (!is_loading)
             .then(|| self.error_nodes.get(&node_id).cloned())
@@ -2799,14 +2900,7 @@ impl DbTreeView {
                 .cursor_pointer()
                 .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
                     view_for_arrow.update(cx, |this, cx| {
-                        let is_expanded = this.expanded_nodes.contains(&node_id_for_arrow);
-                        if is_expanded {
-                            this.expanded_nodes.remove(&node_id_for_arrow);
-                        } else {
-                            this.expanded_nodes.insert(node_id_for_arrow.clone());
-                            this.lazy_load_children(node_id_for_arrow.clone(), cx);
-                        }
-                        this.rebuild_flat_entries(cx);
+                        this.toggle_node_expansion(&node_id_for_arrow, cx);
                     });
                 })
                 .into_any_element()
@@ -3137,6 +3231,7 @@ impl Focusable for DbTreeView {
 mod tests {
     use super::*;
     use db::ipc::{IpcDriverManifest, IpcDriverRegistry};
+    use gpui::{TestAppContext, VisualTestContext};
     use one_core::storage::{ConnectionType, DbConnectionConfig};
 
     fn build_node(node_type: DbNodeType, name: &str, metadata: &[(&str, &str)]) -> DbNode {
@@ -3450,5 +3545,196 @@ mod tests {
         assert_eq!(DbNodeType::Table, context.node_type);
         assert_eq!(DatabaseType::MySQL, context.database_type);
         assert_eq!("conn-1", context.connection_id);
+    }
+
+    #[test]
+    fn search_branch_expands_when_children_match() {
+        let state = SearchExpansionState::default();
+
+        assert!(state.should_expand_branch("db-app", true));
+        assert!(!state.should_expand_branch("db-app", false));
+    }
+
+    #[test]
+    fn search_branch_stays_collapsed_after_manual_collapse() {
+        let mut state = SearchExpansionState::default();
+        state.mark_expanded("db-app");
+        assert!(state.is_expanded("db-app"));
+
+        state.record_toggle("db-app", true);
+
+        assert!(!state.should_expand_branch("db-app", true));
+        assert!(state.is_collapsed_by_user("db-app"));
+    }
+
+    #[test]
+    fn expanding_a_branch_again_clears_the_manual_collapse() {
+        let mut state = SearchExpansionState::default();
+        state.record_toggle("db-app", true);
+
+        state.record_toggle("db-app", false);
+
+        assert!(!state.is_collapsed_by_user("db-app"));
+        assert!(state.should_expand_branch("db-app", true));
+    }
+
+    #[test]
+    fn new_search_query_forgets_manual_collapses() {
+        let mut state = SearchExpansionState::default();
+        state.record_toggle("db-app", true);
+
+        state.reset_for_new_query();
+
+        assert!(state.should_expand_branch("db-app", true));
+    }
+
+    #[test]
+    fn collapse_all_folds_the_branches_expanded_by_search() {
+        let mut state = SearchExpansionState::default();
+        state.mark_expanded("db-app");
+        state.mark_expanded("tables-folder");
+
+        state.collapse_all_expanded();
+
+        assert!(!state.should_expand_branch("db-app", true));
+        assert!(!state.should_expand_branch("tables-folder", true));
+    }
+
+    #[test]
+    fn rebuilt_list_forgets_branches_expanded_by_the_previous_search() {
+        let mut state = SearchExpansionState::default();
+        state.mark_expanded("db-app");
+
+        state.clear_expanded_branches();
+
+        assert!(!state.is_expanded("db-app"));
+    }
+
+    /// 构造一个「连接 → 数据库 → 表目录 → 表」的搜索测试树。
+    /// 除连接外都带上父上下文，保证只有连接是根节点。
+    fn search_fixture_nodes() -> Vec<DbNode> {
+        let fixture_node = |id: &str, name: &str, node_type: DbNodeType| {
+            DbNode::new(
+                id,
+                name,
+                node_type,
+                "conn-1".to_string(),
+                DatabaseType::MySQL,
+            )
+        };
+
+        let users = fixture_node("node-users", "users", DbNodeType::Table)
+            .with_parent_context("tables-folder");
+        let orders = fixture_node("node-orders", "orders", DbNodeType::Table)
+            .with_parent_context("tables-folder");
+
+        let mut tables = fixture_node("tables-folder", "Tables", DbNodeType::TablesFolder)
+            .with_parent_context("db-app");
+        tables.set_children(vec![users.clone(), orders.clone()]);
+
+        let mut database =
+            fixture_node("db-app", "app", DbNodeType::Database).with_parent_context("conn-1");
+        database.set_children(vec![tables.clone()]);
+
+        let mut connection = fixture_node("conn-1", "conn", DbNodeType::Connection);
+        connection.set_children(vec![database.clone()]);
+
+        vec![connection, database, tables, users, orders]
+    }
+
+    fn search_fixture_view(
+        cx: &mut TestAppContext,
+    ) -> (Entity<DbTreeView>, &mut VisualTestContext) {
+        cx.update(gpui_component::init);
+        let connections: Vec<StoredConnection> = Vec::new();
+        let (view, visual) =
+            cx.add_window_view(|window, cx| DbTreeView::new(&connections, window, cx));
+
+        VisualTestContext::update(visual, |_window, cx| {
+            view.update(cx, |view, cx| {
+                view.db_nodes.clear();
+                for node in search_fixture_nodes() {
+                    view.db_nodes.insert(node.id.clone(), node);
+                }
+                // 让展开路径不会真的去查数据库。
+                view.loaded_children.insert("tables-folder".to_string());
+                view.apply_search_query("users".to_string(), cx);
+            });
+        });
+
+        (view, visual)
+    }
+
+    fn flat_entry_ids(view: &Entity<DbTreeView>, cx: &mut VisualTestContext) -> Vec<String> {
+        cx.read(|cx| {
+            view.read(cx)
+                .flat_entries
+                .iter()
+                .map(|entry| entry.node_id.clone())
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn collapsing_a_search_result_branch_hides_its_matching_children(cx: &mut TestAppContext) {
+        let (view, visual) = search_fixture_view(cx);
+
+        // 搜索命中时，连接 → 数据库 → 表目录整条路径自动展开。
+        assert_eq!(
+            vec!["conn-1", "db-app", "tables-folder", "node-users"],
+            flat_entry_ids(&view, visual)
+        );
+
+        visual.update(|_window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.is_node_expanded("tables-folder"));
+                view.toggle_node_expansion("tables-folder", cx);
+            });
+        });
+
+        // 收起后命中的子表不再出现在扁平列表里。
+        assert_eq!(
+            vec!["conn-1", "db-app", "tables-folder"],
+            flat_entry_ids(&view, visual)
+        );
+        assert!(!visual.read(|cx| view.read(cx).is_node_expanded("tables-folder")));
+
+        // 再次展开可以恢复。
+        visual.update(|_window, cx| {
+            view.update(cx, |view, cx| {
+                view.toggle_node_expansion("tables-folder", cx)
+            });
+        });
+        assert_eq!(
+            vec!["conn-1", "db-app", "tables-folder", "node-users"],
+            flat_entry_ids(&view, visual)
+        );
+    }
+
+    #[gpui::test]
+    fn new_search_query_expands_a_previously_collapsed_branch(cx: &mut TestAppContext) {
+        let (view, visual) = search_fixture_view(cx);
+
+        visual.update(|_window, cx| {
+            view.update(cx, |view, cx| {
+                view.toggle_node_expansion("tables-folder", cx)
+            });
+        });
+        assert_eq!(
+            vec!["conn-1", "db-app", "tables-folder"],
+            flat_entry_ids(&view, visual)
+        );
+
+        visual.update(|_window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_search_query("orders".to_string(), cx)
+            });
+        });
+
+        // 新搜索词不继承上一轮的手动收起：命中的 orders 直接可见。
+        assert_eq!(
+            vec!["conn-1", "db-app", "tables-folder", "node-orders"],
+            flat_entry_ids(&view, visual)
+        );
     }
 }
