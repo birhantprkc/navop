@@ -142,14 +142,29 @@ impl HoverProvider for DefaultSqlHoverProvider {
     }
 }
 
-/// A resolved object: its details markdown plus the byte range of the source
+/// The semantic kind of a resolved object, used to pick the details tab icon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlObjectDetailsKind {
+    Table,
+    Column,
+    Function,
+}
+
+/// A resolved object: its details markdown plus the identity of the source
 /// identifier it was resolved from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlObjectDetails {
-    /// Markdown body shared with the hover popover and the details window.
+    /// Markdown body shared with the hover popover and the details tab.
     pub markdown: String,
     /// Byte range of the whole (possibly qualified) identifier.
     pub range: Range<usize>,
+    /// Stable slug for the object inside its database/schema scope, so the same
+    /// object always maps to the same details tab.
+    pub id: String,
+    /// Object label shown on the details tab (`users`, `users.id`, ...).
+    pub label: String,
+    /// Kind of the resolved object.
+    pub kind: SqlObjectDetailsKind,
 }
 
 /// Full hover pipeline: locate identifier -> resolve -> render markdown.
@@ -181,7 +196,60 @@ pub fn resolve_object_details(
     Some(SqlObjectDetails {
         markdown,
         range: ident.range,
+        id: object_details_id(schema, &object),
+        label: object_label(&object),
+        kind: object_kind(&object),
     })
+}
+
+/// Stable slug for `object` inside its database/schema scope.
+fn object_details_id(schema: &SqlSchema, object: &SqlHoverObject) -> String {
+    let scope = schema
+        .current_database
+        .iter()
+        .chain(schema.current_schema.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(".");
+    let (kind, name) = match object {
+        SqlHoverObject::Table { name, .. } => ("table", name.clone()),
+        SqlHoverObject::Column { table, column } => ("column", format!("{table}.{}", column.name)),
+        SqlHoverObject::Function { signature, .. } => ("function", signature.clone()),
+    };
+    if scope.is_empty() {
+        format!("{kind}:{name}")
+    } else {
+        format!("{scope}:{kind}:{name}")
+    }
+}
+
+/// Label shown on the details tab: the object itself, not its scope.
+fn object_label(object: &SqlHoverObject) -> String {
+    match object {
+        SqlHoverObject::Table { name, .. } => name.clone(),
+        SqlHoverObject::Column { table, column } => format!("{table}.{}", column.name),
+        SqlHoverObject::Function { signature, .. } => signature.clone(),
+    }
+}
+
+fn object_kind(object: &SqlHoverObject) -> SqlObjectDetailsKind {
+    match object {
+        SqlHoverObject::Table { .. } => SqlObjectDetailsKind::Table,
+        SqlHoverObject::Column { .. } => SqlObjectDetailsKind::Column,
+        SqlHoverObject::Function { .. } => SqlObjectDetailsKind::Function,
+    }
+}
+
+/// Offsets to probe for a selection-aware resolution: the selection body first
+/// (start, mid, end), then the bare cursor.
+fn selection_probe_offsets(selection: Option<Range<usize>>, cursor: usize) -> Vec<usize> {
+    match selection {
+        Some(sel) if !sel.is_empty() => {
+            let mid = sel.start + (sel.end - sel.start) / 2;
+            vec![sel.start, mid, sel.end - 1, sel.end, cursor]
+        }
+        _ => vec![cursor],
+    }
 }
 
 /// Selection-aware hover resolution for the context menu.
@@ -196,17 +264,22 @@ pub fn build_lsp_hover_for_selection(
     cursor: usize,
     schema: &SqlSchema,
 ) -> Option<LspHover> {
-    if let Some(sel) = selection
-        && !sel.is_empty()
-    {
-        let mid = sel.start + (sel.end - sel.start) / 2;
-        for offset in [sel.start, mid, sel.end - 1, sel.end] {
-            if let Some(hover) = build_lsp_hover(text, offset, schema) {
-                return Some(hover);
-            }
-        }
-    }
-    build_lsp_hover(text, cursor, schema)
+    selection_probe_offsets(selection, cursor)
+        .into_iter()
+        .find_map(|offset| build_lsp_hover(text, offset, schema))
+}
+
+/// Selection-aware variant of [`resolve_object_details`], used by the context
+/// menu.
+pub fn resolve_object_details_for_selection(
+    text: &str,
+    selection: Option<Range<usize>>,
+    cursor: usize,
+    schema: &SqlSchema,
+) -> Option<SqlObjectDetails> {
+    selection_probe_offsets(selection, cursor)
+        .into_iter()
+        .find_map(|offset| resolve_object_details(text, offset, schema))
 }
 
 /// Best-effort `CREATE TABLE/VIEW` DDL for the identifier at `cursor` (or in
@@ -941,5 +1014,57 @@ mod tests {
         let range = h.range.unwrap();
         assert_eq!(range.start.character, 14);
         assert_eq!(range.end.character, 30);
+    }
+
+    #[test]
+    fn object_details_id_is_scoped_and_kind_qualified() {
+        let schema = sample_schema();
+        let details = |sql: &str, needle: &str| {
+            let offset = sql.find(needle).expect("identifier") + 1;
+            resolve_object_details(sql, offset, &schema).expect("details")
+        };
+
+        let table = details("select * from users", "users");
+        assert_eq!("app.public:table:users", table.id);
+        assert_eq!("users", table.label);
+        assert_eq!(SqlObjectDetailsKind::Table, table.kind);
+
+        let column = details("select * from users where users.id = 1", "id");
+        assert_eq!("app.public:column:users.id", column.id);
+        assert_eq!("users.id", column.label);
+        assert_eq!(SqlObjectDetailsKind::Column, column.kind);
+
+        // Same table name in another scope must not share a tab.
+        let other_scope = sample_schema().with_scope(Some("other".into()), Some("public".into()));
+        let elsewhere = resolve_object_details(
+            "select * from users",
+            "select * from users".find("users").expect("users") + 1,
+            &other_scope,
+        )
+        .expect("details");
+        assert_eq!("other.public:table:users", elsewhere.id);
+    }
+
+    #[test]
+    fn selection_details_resolve_when_the_cursor_sits_at_an_edge() {
+        let schema = sample_schema();
+        let text = "select * from users";
+        let start = text.find("users").expect("users");
+        // Right-clicking a selection leaves the cursor at its start, which
+        // anchors the keyword `from`; the selection body must win.
+        let details = resolve_object_details_for_selection(
+            text,
+            Some(start..start + "users".len()),
+            start,
+            &schema,
+        )
+        .expect("the selection body resolves");
+
+        assert_eq!("app.public:table:users", details.id);
+
+        // Without a selection only the cursor counts.
+        let cursor_only = resolve_object_details_for_selection(text, None, start, &schema)
+            .expect("the bare cursor still resolves");
+        assert_eq!(details.id, cursor_only.id);
     }
 }
