@@ -573,6 +573,49 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
   快照里的两个文件与 zed 源**逐字节相同**。
 - **navop 侧**：`[patch.crates-io]` 的 24 处与 `Cargo.lock` 已切到 `tag = "fork-0.3.116"`
   （由 `script/migrate-to-git-fork.py` 改写），`[workspace.dependencies]` 的
-  `gpui-pre = "0.3.99"` 是 caret 范围，无需改动。
+  `gpui-pre = "0.3.99"` 是 caret 范围，无需改动。该 tag 在真机上未通过（见 §10.4），
+  现为 `tag = "fork-0.3.117"`。
 - 真机判据不变（§10.2）：带 Touch Bar 的机器上反复开关窗口，看进程是否存活，
   以及 `window_teardown` 的退役计数日志、「a retired window's view still holds a layer」告警。
+
+### 10.4 真机结论：退役没治住，触发点不在我们的释放路径（2026-09-27）
+
+- 给 Touch Bar 用户测试的 x86 包（`0.19.2-touchbar-retire`，Mach-O UUID
+  `06a0be38-9ab5-34a2-a75b-2d9e88d7c831`，与本地 `Navop.app` 逐字节同一份，
+  二进制内确认含 `retired a native window` 与 layer 告警串）在 Intel Touch Bar 机
+  （`MacBookPro16,2`，macOS 14.8.9）上，**启动 13 秒后仍然 SIGILL**，栈与修复前完全一致：
+  `-[_NSTouchBarFinderObservation invalidate]` → `removeObserver:forKeyPath:context:`
+  → `-[NSApplication _crashOnException:]`。原生窗口和视图都没被释放，abort 照样发生 ——
+  「保留窗口」这条路在真机上被否证（连同已被现场否证的 100 ms 宽限期，共两次）。
+- 其它仓库的报告（既不用 GPUI，也不共享我们的窗口生命周期）指向同一结论：
+  这是 AppKit 自己的记账问题，不是我们的对象活没了：
+  - `kodezine/RustyCAN#95`（winit/egui）：`_NSTouchBarFinder` 对 responder 链上每个
+    `NSResponder` 注册 `nextResponder` KVO；**responder 链快速变化时排队的多个
+    invalidate 块会二次移除已移除的观察者**，抛 `NSRangeException`——对象是活的，
+    所以异常里才印得出类名（`<WinitView>` / `<ElectronNSWindow>` / `<NSView>`）。
+  - `longbridge/gpui-kit#3192`（GPUI，M1）：偶发，只在**切换最前台 App** 时中过
+    （25 次内 1 次），并直接引用 navop#268。
+  - `dashpay/dash-evo-tool#820`：退出前先 `orderOut:` 所有窗口即可规避（shutdown 变体）。
+  - `johnlindquist/kit#1550`（Electron，观察对象是 window）、`emilk/egui#2768`（eframe，退出时）。
+- 因此真正的致命步骤是 **AppKit 把它自己抛出的记账异常升级为 abort**；
+  `-[NSApplication _crashOnException:]` 的编码是 `v24@0:8@16`，唯一参数就是那个
+  `NSException`。这一层是唯一能覆盖所有变体（焦点切换、关窗、退出）的拦截点。
+- **实现**（fork 侧）：`crates/gpui_macos/src/touch_bar_guard.rs` + 在
+  `MacPlatform::new` 里安装。它接管 `-[NSApplication _crashOnException:]`，
+  **只吞**「名字是 `NSRangeException` 且 reason 含 `_NSTouchBarFinderObservation`」
+  的那一条：那次注销本身已经发生过，没有东西可清理、也没有状态需要靠 abort 保护；
+  其余异常原样转发给原实现，照 AppKit 的意愿 abort。每吞一次打一条 `warn`
+  （默认日志级别可见），现场可据此统计命中次数。
+- **发布**：`fork-0.3.117`（`.gpui-pre/publish` 提交 `06ac137`）。相对 0.3.116 的 delta
+  只有版本号 + `gpui_macos.rs`(+1)、`platform.rs`(+4)、新增 `touch_bar_guard.rs`(266 行)，
+  三个文件与 zed 源逐字节相同；`cargo test -p gpui_macos --lib` = 11 passed / 0 failed
+  （含 3 个守卫测试：过滤条件、真实 `NSException` 读取、只接管一次），
+  `cargo fmt -p gpui_macos -- --check` 通过、`cargo clippy -p gpui_macos --all-targets --no-deps` 干净。
+  navop 侧 24 处 patch 与 `Cargo.lock` 已切到 `tag = "fork-0.3.117"`。
+- **新的真机判据**：同一台 Touch Bar 机上重放 #308（建 SSH 连接 → 输入 → 确定）、
+  反复开关弹窗、⌘-Tab 切走再切回、正常退出，看进程是否存活；存活且在
+  `~/Library/Application Support/onetcli/logs/navop.log` 里出现
+  `ignored an AppKit Touch Bar observer exception` —— 说明原异常确实发生过、守卫拦住了它。
+- **未决**：0.3.116 的退役方案（`window_teardown`）现在既非必需（不是它导致崩溃）
+  也无害，是否回退，等守卫真机验证通过后再定；`RETIRED_WINDOWS` 无上限累积
+  （§10.1 的 P3）同理。
