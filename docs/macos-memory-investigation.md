@@ -622,3 +622,44 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
 - **未决**：0.3.116 的退役方案（`window_teardown`）现在既非必需（不是它导致崩溃）
   也无害，是否回退，等守卫真机验证通过后再定；`RETIRED_WINDOWS` 无上限累积
   （§10.1 的 P3）同理。
+
+### 10.5 第一版守卫把崩溃换成了卡死：改成让异常根本不发生（2026-09-27）
+
+- 真机反馈（同一台 Intel Touch Bar 机，包 `0.19.2-touchbar-guard`，sha256
+  `530d3b081164310671fd0fd88509b6565461bb467d87d1b7de58805135f84803`）：
+  「弹窗按确定后不闪退了，直接卡死 app，点不了任何按钮」。吞掉
+  `_crashOnException:` 里的异常确实拦住了 abort，但把 abort 换成了界面冻结。
+- 机制：吞点选得太靠外。异常那时已经从 `NSDisplayCycleFlush` 里 unwind 出来，
+  直接从 `-[NSApplication _crashOnException:]` 返回，等于让 display cycle 半途收场，
+  事件循环不再推进 ⇒ 转圈、按钮无响应。用「靠后的兜底」换「靠前的预防」方向错了。
+- 新实现（`crates/gpui_macos/src/touch_bar_guard.rs` 重写，`_crashOnException:` 那条彻底删掉）：
+  接管 `removeObserver:forKeyPath:context:` —— 抛出路径上最外层的公开方法 —— 当观察者类名含
+  `_NSTouchBarFinder` 时**直接返回**，其余一律转发 Foundation（照旧抛、照旧 abort）。
+  异常不再发生 ⇒ 没有 unwind、没有半截 display cycle，既不 abort 也不卡死。
+  - 补丁范围按运行时枚举，不写死类名清单。key path 是 `nextResponder`，所以被观察对象必然
+    是 `NSResponder` 子类（窗口 / 视图 / 字段编辑器），补丁集 = `NSObject` ∪ 所有
+    `NSResponder` 子类里**自己实现了该方法**的类。探针当场证明只补 `NSObject` 不够：
+    `NSWindow` 自己实现了 `removeObserver:forKeyPath:context:`，窗口上的注销不经过 `NSObject`。
+  - 实现签名必须 `extern "C-unwind"`：转发路径上的异常要穿回调用者（AppKit 的 display cycle
+    自己会 catch）；`extern "C"` 会让 Rust 在异常穿过守卫时直接 abort。
+  - 跳过时打一条 `debug`（默认 `info` 级别看不到，需要 `RUST_LOG=debug`）；
+    `install()` 用 `Once`，天然幂等，不会把守卫自己记成「原实现」。
+- 验证：`cargo test -p gpui_macos --lib` = **12 passed / 0 failed**，其中 3 个探针跑在
+  **子进程主线程**（ObjC 异常不能被 Rust unwind，跑在 libtest 线程会把测试进程一起带走）：
+  1. finder observation 注册一次、注销两次 ⇒ 必须不抛；
+  2. 普通 `NSObject` 观察者注销两次 ⇒ **必须照旧抛**，子进程应被信号杀掉，测试断言这一点
+     —— 这是「作用域没有放大」的证明；
+  3. 重复 `install()` 不改变替换结果，每个类保留自己的原实现。
+  探针同时断言 `NSObject`/`NSResponder`/`NSView`/`NSControl`/`NSWindow`/`NSTextView`/`NSTextField`
+  的该方法都解析到守卫，且 `NSObject` 在被替换集合里。
+  `cargo fmt` 与 `cargo clippy -p gpui_macos --all-targets --no-deps` 干净。
+- 发布：`fork-0.3.118`（`.gpui-pre/publish` 提交 `f03a8ce`，tag `fork-0.3.118`）；navop 24 处
+  patch 与 `Cargo.lock` 已切到 `tag = "fork-0.3.118"`
+  （`f03a8ce01c630e4022d728f06ef19c366a7fb9d7`），`cargo check -p one-core --all-targets` 通过。
+- **新的真机判据**：先是行为 —— 建连接 → 确定、反复开关弹窗、⌘-Tab 切走再切回、正常退出，
+  既不闪退也不卡死。加分项：用 `RUST_LOG=debug` 从终端起进程，日志里应出现
+  `skipped the Touch Bar finder's retraction`（默认 `info` 级别看不到）。
+  如果仍然出问题，这次会得到**崩溃报告**（而不是卡死）：`.ips` 里若换了类名或换了 reason，
+  说明还有别的变体，按同样思路继续收窄。
+- **未决**：`window_teardown`（退役方案）与 `RETIRED_WINDOWS` 无上限（§10.1 的 P3）是否回退/补上，
+  等这次真机结论后再定。
