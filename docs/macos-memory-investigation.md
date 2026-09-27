@@ -671,3 +671,40 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
   可确认这一版不再有 `_crashOnException:` 那条吞异常逻辑。
   Rosetta 烟测（本机）10 秒存活；测试说明写在
   `~/Downloads/navop-0.19.2-x86_64-touchbar-kvo-noop-测试说明.md`。
+
+### 10.6 红点这条路还没被覆盖：把一次性弹窗也接进统一关闭漏斗（2026-09-27 晚）
+
+- 真机反馈（同一台 Intel Touch Bar 机，包 `0.19.2-touchbar-kvo-noop`，sha256
+  `58aa506f2f857bcbe01709872f7b09dc4e5240bd9757776d87e619b0c70917d0`）：
+  「点确定不闪退了，点左上角的 x 闪退」。⇒ 守卫只在**我们自己发起的关闭**上生效。
+- 触发面确认不窄：`navop#314`（保存连接即崩溃，0.18.5/0.18.6 必现，当天 11 份 `.ips`）
+  与 `navop#308` 是同一签名 —— 堆栈仍是
+  `NSDisplayCycleFlush → -[_NSTouchBarFinderObservation invalidate] →`
+  `removeObserver:forKeyPath:context: → removeObserver:forKeyPath: →`
+  `_removeObserver:forProperty: → objc_exception_throw →`
+  `-[NSApplication _crashOnException:]`（SIGILL）。另外 #314 的机器试过把 Touch Bar 切成
+  功能键模式仍崩 ⇒ 与呈现模式无关。
+- 现在的模型是「两条关闭路线的差别」：
+  1. **我们这一侧**（保存 / 确定 / 取消按钮、Cmd-W）走 `window.remove_window()` +
+     GPUI 延迟回收 ⇒ 现场已经不崩；
+  2. **原生红点**走 AppKit 自己的 `windowShouldClose:` → `-[NSWindow close]` ⇒ 窗口是在
+     **AppKit 的关闭流程里**被销毁的，此刻窗口的响应者（字段编辑器等）可能已经被 AppKit
+     释放，而 Touch Bar 查找器的观察是延迟到下一个显示周期才注销的 —— 守卫再往前一帧也
+     救不回一个已经不在的对象。
+- 改法（navop 侧，不动 gpui fork）：`install_reusable_popup_close_routes` 收敛成
+  `install_popup_close_routes`，并在 `reuse_key` 分支**之外**调用 —— 关闭路线现在对
+  **两类弹窗**都装：红点一律先返回 `false` 取消 AppKit 的关闭，再交给
+  `close_window_for_reuse` 决定「隐藏留着复用」还是「交给 GPUI 的延迟销毁」。
+  一次性弹窗的语义没变（照样销毁），变的只是**销毁时机**：从 AppKit 的关闭流程里挪回
+  我们自己的一轮（保存/确定那条已经验证过的路线）。
+- 验证：`cargo check -p one-core -p main --all-targets` Finished；
+  `cargo test -p one-core --lib` **692 passed / 0 failed**；新增契约测试
+  `every_popup_intercepts_the_native_close_route` 锁住「两类弹窗都装了关闭路线，且这条路线
+  在 `reuse_key` 分支之外」（本机没有 Touch Bar，行为层面无法复现，结构断言是唯一能自动化
+  的防线）。
+- ⚠️ 这是**假设驱动**的改法，不是已验证的结论：判据是同一台机器上「点红点关弹窗」不再闪退。
+  如果还崩，需要那份 `.ips` 的 `asi` 原文（异常名 / reason / 被观察对象的类名）来定位是
+  哪一个变体。
+- 旁路发现（独立问题）：应用内更新检查目前拿到 `403 Forbidden (feigeCode/navop)`
+  （GitHub Release 接口匿名限流，本机日志多次复现），#314 的机器因此停在 0.18.6 并以为
+  「0.18.6 已是最新」。修好之后这条升级路径得先通，否则用户升不上来。

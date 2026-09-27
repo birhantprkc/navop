@@ -148,22 +148,28 @@ pub(crate) fn end_reusable_popup_session(window: &mut Window, cx: &mut App) {
     crate::popup_lifecycle::log_lifecycle("popup_session_ended");
 }
 
-/// 该复用键的弹窗只是被隐藏（还活着）时：用 `factory` 重建它里面的 view，然后重新显示，
-/// 返回 `true`。
-///
-/// 用 `factory`（**本次调用**传进来的那个）而不是上次的，是为了保证内容跟着参数走：
-/// factory 决定 view 的全部入参，重建就等于「按这次的要求重新做一遍内容」。
-///
-/// 探活失败的条目会顺手清掉 —— 窗口可能已经被真正销毁（隐藏失败回落、被系统关掉、
-/// 或退出流程回收），此时返回 `false` 让调用方走新建路径。
-/// 给一个「关闭后复用」的弹窗接上所有关闭入口，让它们统一走「隐藏」。
+/// 给弹窗接上所有关闭入口，让它们统一走 [`crate::window_close::close_window_for_reuse`]。
 ///
 /// 光改视图内的取消/保存按钮是不够的：用户更常点的是**原生标题栏的红点**，那条路径由
 /// AppKit 自己发起（`windowShouldClose:`），不经过应用代码；还有 Cmd-W 一类走
-/// [`crate::window_close::request_close_window`] 的入口。漏掉任何一个，窗口还是会被销毁，
-/// 复用键永远命中不到 —— 也就白改了。
-fn install_reusable_popup_close_routes(window: &mut Window, cx: &mut App) {
-    // ① 原生关闭（macOS 红点 / 平台层 close）。返回 false 表示「别关」，窗口已经被隐藏。
+/// [`crate::window_close::request_close_window`] 的入口。
+///
+/// 漏掉红点不只是「白改」，而是会崩：那条路上窗口是由 AppKit 在**它自己的关闭流程里**
+/// 销毁的，此刻窗口的响应者（字段编辑器等）可能已经被 AppKit 释放，而 Touch Bar 查找器的
+/// 观察却是延迟到下一个显示周期才注销的 —— `-[_NSTouchBarFinderObservation invalidate]`
+/// 于是对一个已经不在的对象调用 `removeObserver:forKeyPath:context:`，异常没人接住，
+/// AppKit 的 `-[NSApplication _crashOnException:]` 直接 abort（现场见 navop#308 / navop#314，
+/// 上游记为 zed#64819）。
+///
+/// 我们这一侧发起的关闭（保存 / 取消按钮、Cmd-W）走的是 `remove_window()` + GPUI 的延迟
+/// 回收，现场反馈已经不再崩；红点必须回到同一条路线上：先取消 AppKit 的关闭，再让
+/// `close_window_for_reuse` 决定「隐藏留着复用」还是「交给 GPUI 回收」。
+///
+/// **两类弹窗都要装**：一次性弹窗（没登记复用键）同样不能让 AppKit 自己销毁窗口，
+/// 否则「保存连接」这种最常见的一步还是闪退。
+fn install_popup_close_routes(window: &mut Window, cx: &mut App) {
+    // ① 原生关闭（macOS 红点 / 平台层 close）。返回 false 表示「别关」：销毁与否交给
+    //    `close_window_for_reuse` 决定，绝不让 AppKit 在自己的关闭流程里销毁窗口。
     window.on_window_should_close(cx, |window, cx| {
         let _ = crate::window_close::close_window_for_reuse(window, cx);
         false
@@ -184,6 +190,14 @@ fn install_reusable_popup_close_routes(window: &mut Window, cx: &mut App) {
     );
 }
 
+/// 该复用键的弹窗只是被隐藏（还活着）时：用 `factory` 重建它里面的 view，然后重新显示，
+/// 返回 `true`。
+///
+/// 用 `factory`（**本次调用**传进来的那个）而不是上次的，是为了保证内容跟着参数走：
+/// factory 决定 view 的全部入参，重建就等于「按这次的要求重新做一遍内容」。
+///
+/// 探活失败的条目会顺手清掉 —— 窗口可能已经被真正销毁（隐藏失败回落、被系统关掉、
+/// 或退出流程回收），此时返回 `false` 让调用方走新建路径。
 fn reshow_reusable_popup(
     key: &'static str,
     options: &PopupWindowOptions,
@@ -545,8 +559,10 @@ fn open_popup_window_inner(
             });
             if let Some(key) = reuse_key {
                 record_reusable_popup(key, window.window_handle(), content.downgrade());
-                install_reusable_popup_close_routes(window, cx);
             }
+            // 关闭路线对两类弹窗都要装：一次性弹窗也必须先取消 AppKit 的关闭、再由 GPUI
+            // 回收，否则「保存连接」这类最常见的关闭动作在红点路径上还是会闪退。
+            install_popup_close_routes(window, cx);
             cx.new(|cx| Root::new(content, window, cx))
         })?;
 
@@ -824,14 +840,27 @@ mod reuse_contract_tests {
         );
     }
 
-    /// 复用窗口要把**所有**关闭入口都接上。
+    /// 去掉行注释和所有空白，用来做「A 紧跟在 B 之后」这类结构断言（不受缩进 / 换行影响）。
     ///
-    /// 只改视图里的取消/保存按钮是不够的：用户更常点的是原生标题栏的红点，那条路径由 AppKit
-    /// 的 `windowShouldClose:` 发起，压根不经过应用代码。漏掉它，窗口还是会被销毁 ——
-    /// 也就等于这次修复对真实用户无效。
+    /// 注释必须一起去掉：注释文字会被压进字符串里，让「上一个有效 token 是什么」判断失真。
+    fn squash_code(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .flat_map(str::chars)
+            .filter(|ch| !ch.is_whitespace())
+            .collect()
+    }
+
+    /// **每一类**弹窗都要接上原生关闭路线，而且这条路线必须在 `reuse_key` 分支**之外**。
+    ///
+    /// 只改视图里的取消/保存按钮是不够的：用户更常点的是原生标题栏的红点，那条路径由
+    /// AppKit 自己发起（`windowShouldClose:`），不经过应用代码，而且窗口是由 AppKit 在
+    /// **它自己的关闭流程里**销毁的 —— 那正是 #308 / #314 的崩溃点。一次性弹窗
+    /// （保存连接那类）没接住红点的话，最常见的关闭动作还是闪退。
     #[test]
-    fn reusable_windows_hide_on_every_close_route() {
-        let routes = body(POPUP_SOURCE, "fn install_reusable_popup_close_routes");
+    fn every_popup_intercepts_the_native_close_route() {
+        let routes = body(POPUP_SOURCE, "fn install_popup_close_routes");
         assert!(
             routes.contains("on_window_should_close"),
             "the native close route (macOS traffic light / windowShouldClose:) must be intercepted"
@@ -842,13 +871,18 @@ mod reuse_contract_tests {
         );
         assert!(
             routes.contains("close_window_for_reuse"),
-            "every intercepted route must end up hiding the window"
+            "every intercepted route must go through the single close funnel"
         );
 
-        let opener = body(POPUP_SOURCE, "fn open_popup_window_inner");
+        let opener = squash_code(body(POPUP_SOURCE, "fn open_popup_window_inner"));
+        let (before_install, _) = opener
+            .split_once("install_popup_close_routes(window,cx);")
+            .expect("the opener must install the close routes on every window it creates");
         assert!(
-            opener.contains("install_reusable_popup_close_routes"),
-            "the reusable opener must install those routes when it creates the window"
+            before_install.ends_with('}'),
+            "install_popup_close_routes must be a sibling of the `reuse_key` branch: inside it, \
+             one-shot popups (the save-connection dialog) would keep letting AppKit destroy the \
+             window and still crash"
         );
     }
 }
