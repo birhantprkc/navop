@@ -663,3 +663,11 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
   说明还有别的变体，按同样思路继续收窄。
 - **未决**：`window_teardown`（退役方案）与 `RETIRED_WINDOWS` 无上限（§10.1 的 P3）是否回退/补上，
   等这次真机结论后再定。
+- **测试包指纹**：`navop-0.19.2-touchbar-kvo-noop-x86_64-apple-darwin.zip`
+  （55844353 字节，sha256 `58aa506f2f857bcbe01709872f7b09dc4e5240bd9757776d87e619b0c70917d0`），
+  Mach-O UUID `FA4C5EB5-D6C7-323A-9C47-44C115523372`（x86_64），bundle id `com.onetcli.app`、
+  ad-hoc 签名、无外部 dylib。二进制里新守卫串各命中 1 次，旧守卫串
+  （`ignored an AppKit Touch Bar observer exception`、`took over NSApplication's`）命中 0 次，
+  可确认这一版不再有 `_crashOnException:` 那条吞异常逻辑。
+  Rosetta 烟测（本机）10 秒存活；测试说明写在
+  `~/Downloads/navop-0.19.2-x86_64-touchbar-kvo-noop-测试说明.md`。
