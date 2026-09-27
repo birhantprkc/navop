@@ -697,6 +697,8 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
   `close_window_for_reuse` 决定「隐藏留着复用」还是「交给 GPUI 的延迟销毁」。
   一次性弹窗的语义没变（照样销毁），变的只是**销毁时机**：从 AppKit 的关闭流程里挪回
   我们自己的一轮（保存/确定那条已经验证过的路线）。
+  ⚠️ **这条只对了一半**：当天真机反馈「确定」确实不崩了，但**红点点仍然闪退** ——
+  也就是说「挪回自己的一轮」还不够，见 §10.7。
 - 验证：`cargo check -p one-core -p main --all-targets` Finished；
   `cargo test -p one-core --lib` **692 passed / 0 failed**；新增契约测试
   `every_popup_intercepts_the_native_close_route` 锁住「两类弹窗都装了关闭路线，且这条路线
@@ -708,3 +710,34 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
 - 旁路发现（独立问题）：应用内更新检查目前拿到 `403 Forbidden (feigeCode/navop)`
   （GitHub Release 接口匿名限流，本机日志多次复现），#314 的机器因此停在 0.18.6 并以为
   「0.18.6 已是最新」。修好之后这条升级路径得先通，否则用户升不上来。
+
+### 10.7 真机判据落在「谁销毁」上：干脆不销毁任何弹窗（2026-09-27 深夜）
+
+- 现场（Intel + Touch Bar，`MacBookPro16,2`，macOS 14.8.9，`0.19.2-touchbar-kvo-noop`）：
+  **「确定」不再闪退，点原生红点仍然闪退**。这把 §10.6 的两条路线模型钉住了 —— 变量不是
+  「有没有守卫」，而是**是谁发起的销毁**：我们自己那条（`remove_window()` + GPUI 延迟回收）
+  已经安全，AppKit 在自己关闭流程里那条还是崩。
+- 改法：既然「哪条路线会销毁」就是变量，那就不留任何一条会销毁的路线。
+  `crates/core/src/popup_window.rs` 把**所有**弹窗都登记进 `PARKED_POPUPS`（没有复用键的
+  一次性弹窗也登记），`close_window_for_reuse` 对弹窗**只隐藏、不销毁**：红点先被 `false`
+  取消（AppKit 不参与销毁），随后窗口 `orderOut` 隐藏 + `end_popup_session` 卸载业务 view。
+  应用运行期间不再存在「销毁原生窗口」这个动作，AppKit 的延迟注销也就永远踩不到已释放对象。
+- 副作用与代价（写在明处）：一次性弹窗没有复用键，隐藏后不会有人重新显示它，下一次打开是
+  **新建**窗口 ⇒ 停放窗口数随打开次数增长、直到退出应用。每个停放窗口只是空壳（业务 view
+  在关闭时已卸载，见 §4.3），但它仍有自己的 NSWindow / layer。收敛方向已定：
+  1. 把热点弹窗（连接表单、端口转发、导入窗口等 `open_popup_window` 调用点）改成
+     `open_reusable_popup_window` —— 数量从「打开次数」收敛到「弹窗种类数」，**且不需要任何销毁**；
+  2. 只有在还有窗口必须销毁时，才考虑「停放数量上限 + 按我们自己的路线延迟销毁最旧的一个」。
+- 计数器口径变化：`live_windows` 现在会随一次性弹窗的打开次数增长（停放窗口也是活窗口），
+  这是**预期**，不再是「复用没命中」的信号。判断复用是否生效改看「同一类弹窗第二次打开时
+  `opened_windows` 是否不再增长、`live_windows` 是否不变」。
+- 验证：`cargo check -p one-core -p main --all-targets` Finished；
+  `cargo test -p one-core --lib` **693 passed / 0 failed**。契约测试：
+  `popup_windows_are_hidden_and_never_destroyed`（弹窗判断在隐藏之前；销毁动作只允许出现在
+  「不是弹窗」与两个失败分支里）、`one_shot_popups_are_registered_as_parked`（一次性弹窗必须
+  登记，且必须在 `reuse_key` 的 `else` 分支 —— 一次性 factory 只能调用一次，接到复用路径上会
+  panic）、`every_popup_intercepts_the_native_close_route`（关闭路线不能被摘掉）。
+- ⚠️ 仍需真机判据（同一台机器）：「点红点关弹窗」既不闪退、也不卡死，而且窗口确实消失了
+  （不出现「点了没反应、窗口还留在那里」—— 那说明 `orderOut` 之后又被重新显示或激活）。
+  底层修法（让 Touch Bar 查找器那次注销根本不抛）仍在 `fork-0.3.118` 的
+  `touch_bar_guard.rs` 里，navop 侧这一层是「即使上游守卫漏了一条路也不崩」的兜底。
