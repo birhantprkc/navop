@@ -614,8 +614,11 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
   navop 侧 24 处 patch 与 `Cargo.lock` 已切到 `tag = "fork-0.3.117"`。
 - **新的真机判据**：同一台 Touch Bar 机上重放 #308（建 SSH 连接 → 输入 → 确定）、
   反复开关弹窗、⌘-Tab 切走再切回、正常退出，看进程是否存活；存活且在
-  `~/Library/Application Support/onetcli/logs/navop.log` 里出现
+  `~/.config/navop/logs/navop.log`（旧目录 `~/.config/one-hub/logs/`）里出现
   `ignored an AppKit Touch Bar observer exception` —— 说明原异常确实发生过、守卫拦住了它。
+  该文件确实收得到 gpui 的 `log` 输出（`tracing-subscriber` 的 `tracing-log` 默认特性
+  已在 `init()` 里装好 `LogTracer`，本机日志里有 36 条 `WARN gpui` 可作证）；
+  但 `took over …` 那条 `info` 发生在日志系统起来之前，多半会被丢掉，不能拿它判断装没装。
 - **未决**：0.3.116 的退役方案（`window_teardown`）现在既非必需（不是它导致崩溃）
   也无害，是否回退，等守卫真机验证通过后再定；`RETIRED_WINDOWS` 无上限累积
   （§10.1 的 P3）同理。
