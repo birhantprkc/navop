@@ -47,6 +47,7 @@ mod tests {
     /// 状态留在 `gpui-base`），其余是同一批文件里本来就来自组件库的控件。
     const MIGRATED_PAGES: &[(&str, &[&str])] = &[
         ("mqtt/ui/messages.js", &["Input", "Select", "Button"]),
+        ("mqtt/ui/topics.js", &["Input", "Button"]),
         ("mqtt/ui/publish.js", &["Input", "Textarea", "Switch"]),
         ("mqtt/ui/subscriptions.js", &["Input", "Select"]),
         ("rocketmq/ui/overview.js", &["Tag", "Button"]),
