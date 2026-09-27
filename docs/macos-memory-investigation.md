@@ -442,3 +442,137 @@ leaks --noContent <PID>
 
 注意：不要给复用注册表加 LRU 淘汰来「限制保留」——淘汰即销毁，等于把 Touch Bar 崩溃挪到淘汰路径上。
 注册表按 `&'static str` 复用键组织，结构上已有上限。
+
+## 10. 原生窗口退役方案：试过、被否，以及原因（2026-09-26）
+
+背景：`fork-0.3.104` 起关窗会真正释放原生窗口，AppKit 的 Touch Bar 观察者可能在被观察视图
+析构之后才注销观察 → 未捕获 ObjC 异常 → 进程终止（上游单据 zed-industries/zed#64819）。
+「等一段时间再释放」已经被现场否证（v0.18.6 = `fork-0.3.110`、v0.19.1 = `fork-0.3.114`
+都带 100 ms 等待，帧序列一致，仍然崩），于是试了另一个方向：
+**关闭后不释放原生窗口，只把重资源摘出来**（`MacWindow::drop` 里把 `MacWindowState`
+从 `windowState` ivar 上摘掉，原生窗口交给一张进程级退役表 `window_teardown::retire`）。
+
+这份实现在 review 中被否，理由不是风格问题，而是明确的正确性/边界问题：
+
+1. **阻断：先摘状态、再 `close()`，会走空指针 `Arc`。**
+   GPUI 在 `GPUIWindow` 上注册了自己的 `close`（`window.rs:487` →
+   `close_window`，`window.rs:3255`），它第一步就是 `get_window_state(this)`；
+   而 `get_window_state`（`window.rs:2468`）不判空就直接 `Arc::from_raw`。
+   所以「`take_window_state(window)` → 之后 `window.close()`」这条链**必然**用空指针构造
+   `Arc`（UB），与 Touch Bar 无关，是每次关窗都走——而且不能简单把 `close()` 提前了事：
+   `MacWindow::drop` 持有状态锁，`close_window` 会再次锁同一个状态。
+
+2. **退役后的原生对象仍会被发消息。**
+   `reset_cursor_rects`（`window.rs:2552`）、`make_backing_layer`（`3279`）、
+   `view_did_change_backing_properties`（`3285`）、`set_frame_size`（`3290`）等注册在
+   窗口/视图类上的方法都无条件 `get_window_state`。把 delegate 置空解决不了这个，
+   需要显式区分 Active / Closing / Retired，并让每个原生入口在退役后安全返回
+   （默认值 / 调用 superclass / 忽略事件）。仅 `window.rs` 内 `get_window_state`
+   就有 42 处调用点，这才是这件事的真实工作量；在一处补 `if raw.is_null()` 不够。
+
+3. **退役表是无界累积，不是复用池。**
+   每真正销毁一个 GPUI 窗口就多留一个原生窗口常驻；`Vec<usize>` 只记录地址，
+   本身不做 Objective-C retain，将来清空列表也不会释放窗口。它可以定义为
+   「有意的泄漏止血」，但不能当作内存增长问题的解决方案。
+
+4. **「只留空窗口、GPU 已释放」的说法不成立。**
+   断开的是 `原生对象 → MacWindowState`；未处理
+   `NSWindow → contentView → GPUIView → backing CAMetalLayer`
+   （`native_view.setWantsLayer(YES)`，`makeBackingLayer` 返回 renderer 的 layer）。
+   而 `gpui_apple::metal_renderer::destroy()` 是空实现（`metal_renderer.rs:444`），
+   所以「释放了 Rust renderer 的引用」不等于「原生 layer 被回收」，这部分必须实测，
+   不能靠注释断言。
+
+结论：**原生销毁作为独立问题继续修，先不动底层。** 主线仍是
+「有界复用（隐藏不销毁）＋ 关闭即结束业务会话」，它已在
+`crates/core/src/window_close.rs` / `crates/core/src/popup_window.rs` 落地且有现场数据支撑。
+若以后重启退役方案，前置条件是上面 1–3 全部补齐（其中 2 需要一次状态机式的生命周期改造），
+而不是扩大 `retire()` 的使用范围。
+
+两条容易误判的边界：
+
+- Navop 目前的隐藏路径（`window_close.rs` 的 `orderOut:`）**不会**进入 `MacWindow::drop`，
+  所以即使底层退役方案成立，也不会自动解决隐藏窗口自身的资源保留。
+- 根 `Cargo.toml` 的 `[patch.crates-io]` 曾指向 `fork-0.3.115`；本地 zed checkout 编译通过
+  **不等于** navop 用上了这份改动，集成必须走 gpui-pre 快照 / 新 tag
+  （2026-09-27 已切到 `fork-0.3.116`，见 §10.3）。
+
+实验版代码先落在 zed checkout 的本地分支 `experiment/native-window-retire`
+（`440483b8ee` 保留作对照，修好的版本见 §10.1 / §10.2 的两个提交），
+现已进入发布分支 `publish/gpui-pre-0.3.116`（见 §10.3）。
+
+### 10.1 重做后的状态（2026-09-26 晚）
+
+review 的 4 条全部按上面 1–3 补齐，重做提交 `827b2105a3`
+（`gpui_macos: Retire a native window without detaching its state or holding its GPU resources`，
+与 `440483b8ee` 相邻，仍在本地 `experiment/native-window-retire` 分支）：
+
+- **不再分离状态。** `windowState` ivar 全程有效，`renderer` 改为 `Option`，加入 `retired` 标记；
+  资源改在**关闭之后**于原地释放（`MacWindowState::retire`），因此 `close_window`
+  仍能看到完整状态（空指针 `Arc` 路径消失）。
+- **入口安全化。** `makeBackingLayer`（回退 super）、`viewDidChangeBackingProperties`、
+  `setFrameSize:`（调 super、不调 drawable 尺寸）、`displayLayer:`、`resetCursorRects`、
+  `viewDidChangeEffectiveAppearance` 都按语义安全返回；输入/拖拽/标签页/delegate 入口
+  在退役后不可达（离屏、非 key、非 first responder、delegate 已置 nil）。
+- **释放被证明。** `retire()` 丢弃 renderer（连带 metal layer、drawable pool、纹理）、
+  accessibility adapter 与**全部回调**（回调会扣住 GPUI 实体，不清就等于把上面那份
+  「业务会话不卸载」的问题挪到底层）；`window_teardown::release_layer` 用
+  `setWantsLayer:NO` 断开视图对 metal layer 的持有，并在 layer 仍在时告警。
+- **边界明确为「按使用量有界的保留」。** 每次退役记一条日志，累计达到
+  `RETIRED_WINDOWS_WARN_THRESHOLD`（32）时告警一次；不设上限、不做淘汰，因为
+  淘汰即释放（会崩）。若导航器发现在长会话里窗口翻页量很大，再考虑原生窗口池。
+
+验证状态：zed 侧 `cargo check / clippy / fmt` 全绿；**本机没有 Touch Bar，
+崩溃本身既未能复现也未能证明修好**。字段判据是 `window_teardown` 的退役计数日志
+与「a retired window's view still holds a layer」告警。
+
+### 10.2 可跑的验证与 CI（2026-09-26 深夜）
+
+用测试把「退役后原生对象存活、renderer 的 metal layer 已释放」变成可核验的判据，
+提交 `8af22191af`（`gpui_macos: Probe what retiring a native window guarantees`，
+仍在本地 `experiment/native-window-retire`）：
+
+- 探针必须跑在**进程主线程**上：AppKit 建窗/显示窗口时抛的 Objective-C 异常无法被 Rust
+  捕获，libtest 又在自己的测试线程上跑用例（实测直接 SIGABRT）。做法是测试重新执行本测试
+  二进制、带上 `GPUI_MACOS_TEARDOWN_PROBE`，由 `#[ctor]` 在 libtest 之前于主线程完成探针并
+  退出；测试只读子进程退出码 —— 这样 `abort` 也会表现为失败，而不是挂住不返回。
+- 探针实际抓到一个真问题：`setWantsLayer: NO` **不会**立刻释放视图的 layer，AppKit 要等到
+  该视图的下一次 display cycle，而退役窗口离屏、永远不会再有 —— 于是 layer（连同它的
+  drawable pool 与纹理）继续被扣着。`release_layer` 现在在置 `setWantsLayer: NO` 之后
+  再把 layer 摘掉，探针断言的正是这个最终状态。
+- 跑法：`cargo test -p gpui_macos --lib window_teardown`（本机 arm64 通过；
+  同 crate 全部 8 个测试通过，`clippy --all-targets` 与 `fmt --check` 全绿）。
+
+CI：`.github/workflows/macos-window-teardown.yml`（fork 专用，不要提到上游 PR），
+在 `macos-15-intel`（x86_64）与 `macos-latest`（arm64）上跑同一个探针。
+
+**明确说明：这个 workflow 复现不了崩溃本身。** 变量不是架构而是 Touch Bar ——
+`_NSTouchBarFinder` 只有插着 Touch Bar 时才装了观察者，GitHub 托管 runner（Intel 与
+arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖的不变量」，真正的 abort
+回归只能在带 Touch Bar 的机器上做（自托管 runner 或人工真机）。
+
+### 10.3 发布与集成（2026-09-27）
+
+退役方案不再是「只在本地的实验」，已经发成 gpui-pre 快照并被 navop 用上：
+
+- **发布基线必须是 `gpui-pre-release`，不是退役提交所在的（纯净）upstream 基线。**
+  navop 的 `remote_desktop_view` 用了 fork-only API（`DynamicTexture` /
+  `Window::update_dynamic_texture`），它只在 `gpui-pre-release` 上；
+  当前 `upstream/main` 里 0 处出现。两个基线在 `crates/gpui_macos` 上逐字节相同，
+  所以换基线只是换基座，cherry-pick 无冲突。
+- **发布分支 `publish/gpui-pre-0.3.116`**（zed checkout）：`gpui-pre-release`
+  → revert 掉旧 100 ms 宽限期（`0c2f3ae37f`，已被退役取代，现场已否证）
+  → cherry-pick 三个退役提交（`440483b8ee` → `827b2105a3` → `8af22191af`）。
+  分支上 `cargo test -p gpui_macos --lib` = 8 passed / 0 failed（含退役探针）、
+  `cargo fmt -p gpui_macos -- --check` 通过；`cargo clippy` 在
+  `crates/gpui/src/window.rs:5154` 报基线自带的 `redundant_clone`（upstream 在新版里已修，
+  本次未触碰该 crate），只影响在快照上跑 clippy，不影响 navop 构建。
+- **快照 `fork-0.3.116`** 已发到 `feigeCode/gpui-pre`（提交 `3f3fd66`）。相对
+  `fork-0.3.115` 的 delta 只有版本号、`crates/gpui_macos/src/window.rs`（229 行）、
+  新增 `window_teardown.rs`（348 行）与 `gpui_macos.rs` 里的 `mod` 声明 ——
+  快照里的两个文件与 zed 源**逐字节相同**。
+- **navop 侧**：`[patch.crates-io]` 的 24 处与 `Cargo.lock` 已切到 `tag = "fork-0.3.116"`
+  （由 `script/migrate-to-git-fork.py` 改写），`[workspace.dependencies]` 的
+  `gpui-pre = "0.3.99"` 是 caret 范围，无需改动。
+- 真机判据不变（§10.2）：带 Touch Bar 的机器上反复开关窗口，看进程是否存活，
+  以及 `window_teardown` 的退役计数日志、「a retired window's view still holds a layer」告警。
