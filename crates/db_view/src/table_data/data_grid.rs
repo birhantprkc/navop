@@ -47,7 +47,7 @@ use gpui_component::button::ButtonVariants;
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use one_core::gpui_tokio::Tokio;
-use one_core::popup_window::{PopupWindowOptions, open_popup_window};
+use one_core::popup_window::{PopupWindowOptions, open_reusable_popup_window};
 use one_core::settings::{
     AppSettings, LargeTextCellEditorOpenMode, TableViewMode, installed_grid_monospace_font,
 };
@@ -2068,9 +2068,19 @@ impl DataGrid {
             .detach();
         }
 
-        open_popup_window(
+        // 复用键按「哪一个连接库里的哪一张表」区分：同一张表的导出窗口反复打开
+        // 复用同一个原生窗口，不同表各自的窗口不会互相顶掉。
+        let reuse_key = format!(
+            "table-export:{}:{}.{}.{}",
+            self.config.connection_id,
+            self.config.database_name,
+            self.config.schema_name.as_deref().unwrap_or(""),
+            self.config.table_name
+        );
+        open_reusable_popup_window(
             PopupWindowOptions::new(t!("TableDataGrid.export_table").to_string())
                 .size(800.0, 600.0),
+            reuse_key,
             move |_window, _cx| export_view.clone(),
             Some(window),
             cx,

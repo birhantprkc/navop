@@ -69,6 +69,11 @@ pub type SshFormSavedCallback = Arc<
     dyn Fn(StoredConnection, SshFormPostSaveAction, &mut Window, &mut App) + Send + Sync + 'static,
 >;
 
+/// SSH 表单窗口配置
+///
+/// `Clone` 是复用窗口的前提：同一类弹窗按目标复用同一个原生窗口，重建 view 时要把
+/// 配置按本次调用重新给一遍（见 `one_core::popup_window::open_reusable_popup_window`）。
+#[derive(Clone)]
 pub struct SshFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
     pub initial_connection: Option<StoredConnection>,
@@ -2190,7 +2195,7 @@ impl SshFormWindow {
                 if let Some(callback) = self.on_saved.as_ref() {
                     callback(saved_conn, post_save_action(self.save_action), window, cx);
                 }
-                window.remove_window();
+                let _ = one_core::window_close::close_window_for_reuse(window, cx);
             }
             Err(e) => {
                 let error_msg = t!("SSH.save_failed", error = e).to_string();
@@ -2201,8 +2206,8 @@ impl SshFormWindow {
         }
     }
 
-    fn on_cancel(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
-        window.remove_window();
+    fn on_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = one_core::window_close::close_window_for_reuse(window, cx);
     }
 
     fn render_form_row(&self, label: &str, child: impl IntoElement) -> Div {

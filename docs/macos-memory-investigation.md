@@ -870,3 +870,33 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
 - 遗留：`window_teardown` 的「不销毁」现在是这版守卫的兜底；等守卫在真机存活后可以撤销，
   让原生窗口重新被释放（停放窗口的内存代价随之消失）。
 
+
+### 10.12 「不销毁窗口」收进一个开关，只给 Intel Mac 打开（2026-09-29）
+
+§10.7 的「不销毁任何弹窗」当时是无条件生效的：所有平台、所有构建都在付「隐藏的原生窗口
+一直占着 NSWindow / CAMetalLayer」这个代价，而 Touch Bar 只存在于 x86_64 机型。这一版把它
+收敛成一个 cargo feature：
+
+- **开关**：`crates/core/Cargo.toml` 的 `macos-touchbar-window-hide`（`default = []`），
+  `main/Cargo.toml` 转发。整个链路只读**一个常量**：
+  `one_core::window_close::HIDE_WINDOWS_ON_CLOSE = cfg!(all(target_os = "macos", feature = "macos-touchbar-window-hide"))`。
+  之所以不做成散落的 `#[cfg]`，是因为 `popup_window.rs`（弹窗注册与关闭路由）、
+  `window_close.rs`（关闭漏斗）、`remote_file_editor::editor_window_visibility`（编辑器窗口）
+  三处必须**同时**成立：任何一处单独打开，都会出现「窗口被隐藏但没进复用表」或者
+  「业务会话已结束却还在等这个窗口」的错配。
+- **生效范围**：只有发布流水线为 `x86_64-apple-darwin` 传 `--features macos-touchbar-window-hide`
+  （`release.yml` 里的 `extra_features`，其余 target 为空）。ARM macOS / Windows / Linux 拿到的是
+  加这套机制之前的形态：关闭即销毁。打包契约测试 `script/test-release-packaging.mjs` 钉住三点 ——
+  feature 只出现一次、只挂在 `x86_64-apple-darwin` 判定下、两条编译命令（`cargo zigbuild` /
+  `cargo build`）都通过同一个变量消费它。
+- **为什么不开给 ARM Mac**：ARM 机型没有 Touch Bar，崩溃链不存在；而代价是真实的 —— 隐藏的
+  窗口不会释放，`CAMetalLayer` 与它的缓冲区会留在进程里。没有收益只有代价的默认值不该改。
+- **顺带补齐「所有打开窗口的地方」**：开关生效时，弹窗一律走复用（`open_reusable_popup_window`
+  + 按目标取键，例如 `connection-form:ssh:42`、`table-export:{conn}:{db}.{schema}.{table}`），
+  视图内部原先自己 `window.remove_window()` 的 15 个表单/工具栏窗口改成走
+  `one_core::window_close::close_window_for_reuse(window, cx)`。源码契约测试
+  `secondary_windows_never_destroy_themselves`（`crates/core/src/window_close.rs`）逐文件断言
+  这些文件里不再出现 `window.remove_window()`：漏掉任何一个入口，那条入口就会照旧销毁原生
+  窗口，#308 的「确定/取消」、#314 的「保存」都是这么漏出来的。
+- **仍未解决的**：`fork-0.3.122` 的守卫（§10.11）依然是「隐藏」之外的第二道兜底，两者都保留。
+  等守卫在真机稳定，可以反过来撤掉隐藏、让原生窗口重新被释放。

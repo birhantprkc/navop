@@ -266,4 +266,93 @@ mod tests {
 
         assert!(!state.contains(window_id));
     }
+
+    /// 除主窗口外，业务代码里不允许再自己销毁窗口。
+    ///
+    /// 「关闭即隐藏」只要漏掉一个入口就等于没修：那条入口照样会销毁原生窗口，AppKit 的
+    /// Touch Bar 观察者照样会在下一个显示周期里踩到已释放的对象（#308 的「确定」和
+    /// 「取消」、#314 的「保存」都是这么漏出来的）。所以把「弹窗 / 表单窗口把自己的关闭动作
+    /// 一律交给 `close_window_for_reuse`」钉成一条源码契约。
+    ///
+    /// 允许直接销毁的地方只剩下面三类，它们都不在契约清单里：
+    /// - 主窗口那条链（关闭主窗口 = 隐藏到托盘或退出应用）；
+    /// - `close_window_for_reuse` 自己，以及 `hide_for_reuse` 返回 `Ok(false)` / `Err` 时的兜底；
+    /// - 编辑器窗口的兜底分支（`prepare_window_close` 返回 `true` 才销毁，已经在它自己的
+    ///   测试里逐个方法断言过）。
+    #[test]
+    fn secondary_windows_never_destroy_themselves() {
+        // include_str! 用的是相对于本文件的路径，所以从 crates/core/src 往上退三级。
+        let sources: [(&str, &str); 15] = [
+            (
+                "main/src/new_connection/connection_window.rs",
+                include_str!("../../../main/src/new_connection/connection_window.rs"),
+            ),
+            (
+                "main/src/credential_vault/form_window.rs",
+                include_str!("../../../main/src/credential_vault/form_window.rs"),
+            ),
+            (
+                "crates/db_view/src/connection_form_window.rs",
+                include_str!("../../../crates/db_view/src/connection_form_window.rs"),
+            ),
+            (
+                "crates/connection_form/src/middleware_form/window.rs",
+                include_str!("../../../crates/connection_form/src/middleware_form/window.rs"),
+            ),
+            (
+                "crates/mongodb_view/src/mongo_form_window.rs",
+                include_str!("../../../crates/mongodb_view/src/mongo_form_window.rs"),
+            ),
+            (
+                "crates/redis_view/src/redis_form_window.rs",
+                include_str!("../../../crates/redis_view/src/redis_form_window.rs"),
+            ),
+            (
+                "crates/remote_desktop_view/src/remote_desktop_form.rs",
+                include_str!("../../../crates/remote_desktop_view/src/remote_desktop_form.rs"),
+            ),
+            (
+                "crates/remote_desktop_view/src/remote_desktop_form/connection_test.rs",
+                include_str!(
+                    "../../../crates/remote_desktop_view/src/remote_desktop_form/connection_test.rs"
+                ),
+            ),
+            (
+                "crates/terminal_view/src/ssh_form_window.rs",
+                include_str!("../../../crates/terminal_view/src/ssh_form_window.rs"),
+            ),
+            (
+                "crates/terminal_view/src/ftp_form_window.rs",
+                include_str!("../../../crates/terminal_view/src/ftp_form_window.rs"),
+            ),
+            (
+                "crates/terminal_view/src/telnet_form_window.rs",
+                include_str!("../../../crates/terminal_view/src/telnet_form_window.rs"),
+            ),
+            (
+                "crates/terminal_view/src/serial_form_window.rs",
+                include_str!("../../../crates/terminal_view/src/serial_form_window.rs"),
+            ),
+            (
+                "crates/port_forwarding_view/src/form_window.rs",
+                include_str!("../../../crates/port_forwarding_view/src/form_window.rs"),
+            ),
+            (
+                "crates/port_forwarding_view/src/view.rs",
+                include_str!("../../../crates/port_forwarding_view/src/view.rs"),
+            ),
+            (
+                "crates/universal-plugins/src/extension_connection_form.rs",
+                include_str!("../../../crates/universal-plugins/src/extension_connection_form.rs"),
+            ),
+        ];
+
+        for (path, source) in sources {
+            assert!(
+                !source.contains("window.remove_window()"),
+                "{path} 里还有直接销毁窗口的写法：这类窗口必须走 one_core::window_close::close_window_for_reuse，\
+                 否则 Intel Mac（Touch Bar）上关闭时会闪退"
+            );
+        }
+    }
 }
