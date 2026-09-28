@@ -15,6 +15,7 @@ mod database_users_toolbar;
 pub mod database_view_plugin;
 pub mod db_object_selector;
 mod db_tree_event;
+mod db_tree_search;
 pub mod db_tree_view;
 mod driver_i18n;
 pub mod er_diagram;

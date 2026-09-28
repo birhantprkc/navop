@@ -13,8 +13,8 @@ use gpui::{
     Task, UniformListScrollHandle, Window, div, prelude::FluentBuilder, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IndexPath, Selectable, Sizable, Size as ComponentSize,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme, Disableable as _, Icon, IndexPath, Selectable, Sizable, Size as ComponentSize,
+    button::{Button, ButtonVariants as _, Toggle},
     checkbox::Checkbox,
     clipboard::Clipboard,
     h_flex,
@@ -35,6 +35,7 @@ use tracing::log::{error, info, trace, warn};
 
 // 3. 当前 crate 导入（按模块分组）
 use crate::database_view_plugin::{build_context_menu_for, supports_database_action_for};
+use crate::db_tree_search::{TreeSearchMatcher, TreeSearchOptions, search_toggle_views};
 use crate::extension_menu::{
     DbTreeExtensionActionContext, DbTreeExtensionMenuContext, DbTreeExtensionMenuItem,
     DbTreeExtensionMenuRegistry, GlobalDbTreeExtensionActionHandler,
@@ -610,8 +611,8 @@ impl SearchExpansionState {
 /// 一次扁平化遍历的上下文。
 #[derive(Clone, Copy)]
 struct FlatEntryWalk<'a> {
-    /// 当前搜索词（空串表示非搜索态）。
-    query: &'a str,
+    /// 本次搜索的匹配器（搜索词为空时不做任何过滤）。
+    matcher: &'a TreeSearchMatcher,
     /// 当前所属连接，用于数据库筛选。
     connection_id: Option<&'a str>,
     /// 是否位于「搜索中用户主动展开的分支」子树内：子树内不再按搜索词过滤。
@@ -646,6 +647,8 @@ pub struct DbTreeView {
     search_input: Entity<InputState>,
     // 搜索关键字
     search_query: String,
+    /// 搜索框右侧开关（大小写 / 全词 / 正则）。
+    search_options: TreeSearchOptions,
     // 搜索防抖序列号
     search_seq: u64,
     search_debouncer: Arc<Debouncer>,
@@ -907,6 +910,7 @@ impl DbTreeView {
             workspace_id,
             search_input,
             search_query: String::new(),
+            search_options: TreeSearchOptions::default(),
             search_seq: 0,
             search_debouncer,
             selected_databases: unselected_databases_map,
@@ -1178,7 +1182,7 @@ impl DbTreeView {
         self.expanded_nodes.clear();
         // 搜索命中的分支是自动展开的：折叠全部时也要把它们收起来，
         // 否则列表看上去毫无变化。
-        if !self.search_query.is_empty() {
+        if self.is_searching() {
             self.search_expansion.collapse_all_expanded();
         }
         self.rebuild_flat_entries(cx);
@@ -1876,11 +1880,10 @@ impl DbTreeView {
             .collect();
         root_nodes.sort();
 
-        let search_query = self.search_query.to_lowercase();
-
         // 递归添加条目
+        let matcher = TreeSearchMatcher::new(&self.search_query, self.search_options);
         let walk = FlatEntryWalk {
-            query: &search_query,
+            matcher: &matcher,
             connection_id: None,
             force_visible: false,
         };
@@ -1898,7 +1901,6 @@ impl DbTreeView {
         depth: usize,
         walk: FlatEntryWalk<'_>,
     ) -> bool {
-        let query = walk.query;
         let node = match self.db_nodes.get(node_id) {
             Some(n) => n.clone(),
             None => return false,
@@ -1926,14 +1928,7 @@ impl DbTreeView {
         }
 
         // 检查当前节点是否匹配搜索（用户主动展开的分支内不再过滤）
-        let self_matches = walk.force_visible
-            || query.is_empty()
-            || node.name.to_lowercase().contains(query)
-            || node
-                .metadata
-                .get("comment")
-                .map(|c| c.to_lowercase().contains(query))
-                .unwrap_or(false);
+        let self_matches = walk.force_visible || Self::node_matches_query(&node, walk.matcher);
 
         // 检查子节点是否有匹配的
         let mut has_matching_children = false;
@@ -1943,7 +1938,7 @@ impl DbTreeView {
             for child in &node.children {
                 let child_id = child.id.clone();
                 // 递归检查子节点（但先不添加，只是检查是否匹配）
-                if self.check_node_matches(&child_id, query, conn_id) {
+                if self.check_node_matches(&child_id, walk.matcher, conn_id) {
                     has_matching_children = true;
                     matching_children.push(child_id);
                 }
@@ -1963,7 +1958,8 @@ impl DbTreeView {
 
         // 搜索期间命中的分支自动展开（用户手动收起过则保持收起），
         // 非搜索期间沿用持久展开状态。
-        let should_show_children = if query.is_empty() {
+        let search_active = !walk.matcher.is_empty();
+        let should_show_children = if !search_active {
             self.expanded_nodes.contains(node_id)
         } else {
             let expanded = self
@@ -1978,11 +1974,10 @@ impl DbTreeView {
         if should_show_children {
             // 搜索态下用户在「过滤后一个子项都没有」的分支上主动展开：
             // 该分支子树不再参与搜索过滤，否则点开也看不到任何节点。
-            let opens_empty_branch = !query.is_empty()
-                && !has_matching_children
-                && self.search_expansion.is_opened(node_id);
+            let opens_empty_branch =
+                search_active && !has_matching_children && self.search_expansion.is_opened(node_id);
             let child_walk = FlatEntryWalk {
-                query,
+                matcher: walk.matcher,
                 connection_id: conn_id,
                 force_visible: walk.force_visible || opens_empty_branch,
             };
@@ -1996,11 +1991,23 @@ impl DbTreeView {
         true
     }
 
+    /// 节点的名称或备注是否命中当前搜索（搜索词为空时都算命中）。
+    fn node_matches_query(node: &DbNode, matcher: &TreeSearchMatcher) -> bool {
+        if matcher.is_empty() {
+            return true;
+        }
+        matcher.matches(&node.name)
+            || node
+                .metadata
+                .get("comment")
+                .is_some_and(|comment| matcher.matches(comment))
+    }
+
     /// 检查节点是否匹配搜索条件（不添加条目，仅检查）
     fn check_node_matches(
         &self,
         node_id: &str,
-        query: &str,
+        matcher: &TreeSearchMatcher,
         current_connection_id: Option<&str>,
     ) -> bool {
         let node = match self.db_nodes.get(node_id) {
@@ -2030,21 +2037,14 @@ impl DbTreeView {
         }
 
         // 检查当前节点是否匹配
-        let self_matches = query.is_empty()
-            || node.name.to_lowercase().contains(query)
-            || node
-                .metadata
-                .get("comment")
-                .map(|c| c.to_lowercase().contains(query))
-                .unwrap_or(false);
-        if self_matches {
+        if Self::node_matches_query(node, matcher) {
             return true;
         }
 
         // 检查子节点
         if node.children_loaded {
             for child in &node.children {
-                if self.check_node_matches(&child.id, query, conn_id) {
+                if self.check_node_matches(&child.id, matcher, conn_id) {
                     return true;
                 }
             }
@@ -2097,7 +2097,7 @@ impl DbTreeView {
     /// 搜索词变化时一并丢弃上一轮搜索里的手动收起记忆，
     /// 让新命中的分支重新展开。
     fn apply_search_query(&mut self, query: String, cx: &mut Context<Self>) {
-        if query.to_lowercase() != self.search_query.to_lowercase() {
+        if query != self.search_query {
             self.search_expansion.reset_for_new_query();
         }
         self.search_query = query;
@@ -2109,16 +2109,36 @@ impl DbTreeView {
         self.rebuild_flat_entries(cx);
     }
 
+    /// 搜索词是否正在生效（只键入空白不算）。
+    fn is_searching(&self) -> bool {
+        !self.search_query.trim().is_empty()
+    }
+
     /// 节点当前是否呈现为展开。
     ///
     /// 搜索态下箭头必须与实际渲染出来的子项一致，否则会出现
     /// 「箭头是展开的、下面却没有节点」；非搜索态沿用持久展开状态。
     fn is_node_expanded(&self, node_id: &str) -> bool {
-        if self.search_query.is_empty() {
-            self.expanded_nodes.contains(node_id)
-        } else {
+        if self.is_searching() {
             self.search_expansion.is_expanded(node_id)
+        } else {
+            self.expanded_nodes.contains(node_id)
         }
+    }
+
+    /// 切换搜索框右侧的匹配开关（大小写 / 全词 / 正则）。
+    pub(crate) fn set_search_options(
+        &mut self,
+        options: TreeSearchOptions,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search_options == options {
+            return;
+        }
+        self.search_options = options;
+        // 匹配方式变了等于换了一次搜索：忘掉上一轮的手动展开/收起意愿。
+        self.search_expansion.reset_for_new_query();
+        self.rebuild_flat_entries(cx);
     }
 
     /// 切换节点的展开状态。
@@ -2134,11 +2154,50 @@ impl DbTreeView {
             self.expanded_nodes.insert(node_id.to_string());
             self.lazy_load_children(node_id.to_string(), cx);
         }
-        if !self.search_query.is_empty() {
+        if self.is_searching() {
             // 切换前是展开状态，就意味着这次操作是「收起」。
             self.search_expansion.record_toggle(node_id, expanded);
         }
         self.rebuild_flat_entries(cx);
+    }
+
+    /// 搜索框右侧的匹配开关：大小写（Cc）、全词（W）、正则（.*）。
+    fn render_search_options(&self, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity();
+        let mut row = h_flex().gap_0p5().items_center();
+        for toggle in search_toggle_views(self.search_options, self.has_invalid_regex()) {
+            let view = view.clone();
+            let next = toggle.next;
+            row = row.child(
+                Toggle::new(toggle.element_id)
+                    .label(toggle.label)
+                    .tooltip(toggle.tooltip)
+                    .checked(toggle.checked)
+                    .disabled(toggle.disabled)
+                    .xsmall()
+                    .when(toggle.invalid, |this| this.text_color(cx.theme().red))
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| this.set_search_options(next, cx));
+                    }),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// 当前搜索词写成非法正则（搜索框要给出提示）。
+    fn has_invalid_regex(&self) -> bool {
+        self.search_options.has_invalid_regex(&self.search_query)
+    }
+
+    /// 行内高亮用的搜索词。
+    ///
+    /// 正则模式下的匹配位置反推不出字面量，索性不高亮，避免误导。
+    fn highlight_query(&self) -> SharedString {
+        if self.search_options.regex {
+            SharedString::default()
+        } else {
+            self.search_query.trim().to_string().into()
+        }
     }
 
     fn render_database_filter_popover(
@@ -2685,6 +2744,7 @@ impl Render for DbTreeView {
             .child({
                 let view_for_collapse = cx.entity();
                 let view_for_locate = cx.entity();
+                let search_options = self.render_search_options(cx);
                 h_flex()
                     .w_full()
                     .p_1()
@@ -2701,7 +2761,8 @@ impl Render for DbTreeView {
                                 )
                                 .cleanable(true)
                                 .small()
-                                .w_full(),
+                                .w_full()
+                                .suffix(search_options),
                         ),
                     )
                     .child(
@@ -2738,7 +2799,7 @@ impl Render for DbTreeView {
                             .overflow_scroll()
                             .p_2()
                             .map(|this| {
-                                if entries_len == 0 && !self.search_query.is_empty() {
+                                if entries_len == 0 && self.is_searching() {
                                     this.child(
                                         ContentState::empty(t!("Common.not_found").to_string())
                                             .icon(IconName::Search)
@@ -2825,7 +2886,7 @@ impl DbTreeView {
             .then(|| self.error_nodes.get(&node_id).cloned())
             .flatten();
         let has_children = self.node_has_children(&node_id);
-        let search_query = self.search_query.clone();
+        let search_query = self.highlight_query();
 
         // 获取图标
         let icon = self.get_icon_for_node(&node_id, is_expanded, cx);
@@ -3269,6 +3330,7 @@ impl Focusable for DbTreeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db_tree_search::TreeSearchToggle;
     use db::ipc::{IpcDriverManifest, IpcDriverRegistry};
     use gpui::{TestAppContext, VisualTestContext};
     use one_core::storage::{ConnectionType, DbConnectionConfig};
@@ -3925,5 +3987,155 @@ mod tests {
             view.update(cx, |view, cx| view.apply_search_query(String::new(), cx));
         });
         assert_eq!(expanded_path, flat_entry_ids(&view, visual));
+    }
+
+    /// 应用一组搜索开关（等价于点击搜索框右侧的开关）。
+    fn apply_search_options(
+        view: &Entity<DbTreeView>,
+        visual: &mut VisualTestContext,
+        options: TreeSearchOptions,
+    ) {
+        visual.update(|_window, cx| {
+            view.update(cx, |view, cx| view.set_search_options(options, cx));
+        });
+    }
+
+    fn case_sensitive_options() -> TreeSearchOptions {
+        TreeSearchOptions {
+            match_case: true,
+            ..TreeSearchOptions::default()
+        }
+    }
+
+    fn whole_word_options() -> TreeSearchOptions {
+        TreeSearchOptions {
+            whole_word: true,
+            ..TreeSearchOptions::default()
+        }
+    }
+
+    fn regex_options() -> TreeSearchOptions {
+        TreeSearchOptions {
+            regex: true,
+            ..TreeSearchOptions::default()
+        }
+    }
+
+    fn apply_query(view: &Entity<DbTreeView>, visual: &mut VisualTestContext, query: &str) {
+        let query = query.to_string();
+        visual.update(|_window, cx| {
+            view.update(cx, |view, cx| view.apply_search_query(query.clone(), cx));
+        });
+    }
+
+    #[gpui::test]
+    fn the_match_case_switch_filters_out_differently_cased_names(cx: &mut TestAppContext) {
+        let (view, visual) = search_fixture_view(cx);
+        apply_query(&view, visual, "USERS");
+        assert_eq!(
+            vec!["conn-1", "db-app", "tables-folder", "node-users"],
+            flat_entry_ids(&view, visual)
+        );
+
+        apply_search_options(&view, visual, case_sensitive_options());
+        assert!(flat_entry_ids(&view, visual).is_empty());
+
+        // 关掉开关后又恢复大小写不敏感的匹配。
+        apply_search_options(&view, visual, TreeSearchOptions::default());
+        assert_eq!(
+            vec!["conn-1", "db-app", "tables-folder", "node-users"],
+            flat_entry_ids(&view, visual)
+        );
+    }
+
+    #[gpui::test]
+    fn the_whole_word_switch_stops_matching_longer_names(cx: &mut TestAppContext) {
+        let (view, visual) = search_fixture_view(cx);
+        apply_query(&view, visual, "user");
+        assert_eq!(
+            vec!["conn-1", "db-app", "tables-folder", "node-users"],
+            flat_entry_ids(&view, visual)
+        );
+
+        apply_search_options(&view, visual, whole_word_options());
+        assert!(flat_entry_ids(&view, visual).is_empty());
+    }
+
+    #[gpui::test]
+    fn the_regex_switch_takes_over_from_the_plain_text_matching(cx: &mut TestAppContext) {
+        let (view, visual) = search_fixture_view(cx);
+        apply_query(&view, visual, "users|orders");
+        // 没打开正则时这就是一段普通文本，谁都匹配不上。
+        assert!(flat_entry_ids(&view, visual).is_empty());
+
+        // 连「全词」一起打开：正则优先，全词开关被忽略。
+        let options = TreeSearchOptions {
+            whole_word: true,
+            ..regex_options()
+        };
+        apply_search_options(&view, visual, options);
+
+        assert_eq!(
+            vec![
+                "conn-1",
+                "db-app",
+                "tables-folder",
+                "node-users",
+                "node-orders"
+            ],
+            flat_entry_ids(&view, visual)
+        );
+        assert!(visual.read(|cx| {
+            view.read(cx)
+                .search_options
+                .is_disabled(TreeSearchToggle::WholeWord)
+        }));
+    }
+
+    #[gpui::test]
+    fn an_invalid_regex_shows_an_empty_tree_and_is_reported(cx: &mut TestAppContext) {
+        let (view, visual) = search_fixture_view(cx);
+        apply_query(&view, visual, "users(");
+        apply_search_options(&view, visual, regex_options());
+
+        assert!(flat_entry_ids(&view, visual).is_empty());
+        assert!(visual.read(|cx| view.read(cx).has_invalid_regex()));
+    }
+
+    #[gpui::test]
+    fn the_highlight_follows_the_query_but_is_dropped_in_regex_mode(cx: &mut TestAppContext) {
+        let (view, visual) = search_fixture_view(cx);
+        apply_query(&view, visual, "  users  ");
+        assert_eq!(
+            "users",
+            visual
+                .read(|cx| view.read(cx).highlight_query())
+                .to_string()
+        );
+
+        // 正则模式下匹配位置反推不出字面量，索性不高亮。
+        apply_search_options(&view, visual, regex_options());
+        assert!(visual.read(|cx| view.read(cx).highlight_query()).is_empty());
+    }
+
+    #[gpui::test]
+    fn switching_a_search_option_forgets_the_manual_collapse(cx: &mut TestAppContext) {
+        let (view, visual) = search_fixture_view(cx);
+        visual.update(|_window, cx| {
+            view.update(cx, |view, cx| {
+                view.toggle_node_expansion("tables-folder", cx)
+            });
+        });
+        assert_eq!(
+            vec!["conn-1", "db-app", "tables-folder"],
+            flat_entry_ids(&view, visual)
+        );
+
+        // 换了匹配方式等于换了一次搜索：命中的分支重新展开。
+        apply_search_options(&view, visual, whole_word_options());
+        assert_eq!(
+            vec!["conn-1", "db-app", "tables-folder", "node-users"],
+            flat_entry_ids(&view, visual)
+        );
     }
 }
