@@ -787,3 +787,35 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
   引入最少新机制的形态。老崩溃家族（窗口销毁期被注销）由「不销毁」消除；如果仍偶发，再用
   `GPUI_MACOS_TOUCHBAR_GUARD=1` 从终端启动来验证「修好的守卫」是否有效 —— 这是两条独立的
   防线，**不要**在没有真机证据的情况下同时打开。
+
+### 10.9 守卫不能关：关掉之后「确定 / 取消」又崩了，恢复默认开启（2026-09-28 中午）
+
+- 现场（同一台 Intel + Touch Bar，`0.19.2-touchbar-hide-only-noguard`，`slice_uuid`
+  `F6C3E655-…`）：**红点关闭与 RDP 全屏不崩了** —— §10.7 的「不销毁」确实治住了销毁触发的
+  那个变体 —— 但**点弹窗的「确定 / 取消」仍然闪退**。
+- 这份报告（`navop-2026-09-28-123639.ips`）的 `asi` 栈与最早那份完全同型：
+  `-[NSApplication _crashOnException:]` ← `__exceptionPreprocess` ← `objc_exception_throw`
+  ← `-[NSObject _removeObserver:forProperty:]` ← `removeObserver:forKeyPath:` ←
+  `removeObserver:forKeyPath:context:` ← `-[_NSTouchBarFinderObservation invalidate]` ←
+  `___NSTouchBarFinderSetNeedsUpdateOnMain_block_invoke_2` ← `NSDisplayCycleObserverInvoke`
+  ← `NSDisplayCycleFlush` ← `CATransaction` ← 主 runloop；`EXC_BAD_INSTRUCTION (SIGILL)`、
+  Trap 6。**关键点：这条链里没有一帧与「窗口被销毁」有关**，被注销的 observation 属于一个
+  还活着的视图。
+- 结论：§10.8 把守卫默认关掉是**假设被真机否掉**。当时的推理是「不销毁窗口 ⇒ 守卫要挡的场景
+  消失」，但证据说明这个异常不只出现在视图将死时：同一轮显示周期里两次 `nextResponder` 链变化
+  就够了（上游 RustyCAN#96 记录的就是这个）。所以恢复默认开启；递归缺陷已在 §10.8 修掉，
+  两者不冲突。
+- 改法：`fork-0.3.120`（zed 提交 `7485783f80`，快照 `053628ba`）把开关语义反过来 ——
+  **默认安装**，只有 `GPUI_MACOS_TOUCHBAR_GUARD` 显式写成 `0`/`false`/`off`/`no` 才不装；
+  空串按「没设」处理（防止包装脚本把守卫静默关掉）。`guard_requested_by` → `guard_disabled_by`
+  （语义取反）。
+- 验证：`cargo test -p gpui_macos --lib` **14 passed / 0 failed**，
+  `the_guard_is_on_unless_the_environment_says_off` 同时断言「什么都不设 ⇒ 守卫确实装上」
+  与「设成 `0` ⇒ 确实不装」；`cargo check -p one-core -p main --all-targets` 通过。
+- 发给真机的第 5 版组合：**不销毁弹窗（§10.7）+ 守卫默认开启（本节）**。两个变体各有真机
+  证据支撑：红点 / RDP 全屏那条由「不销毁」治住，「确定 / 取消」那条由守卫治住。
+- ⚠️ 仍未解释：`navop-2026-09-27-165228.ips`（退出应用时 Foundation KVO 记账里
+  `KERN_INVALID_ADDRESS`）。它只在带着守卫时出现过，推断是「跳过查找器注销」留下的悬空
+  observation，但没有证据；目前没有别的办法通过「确定 / 取消」这条路径，只能带着这个已知风险。
+  真机若再出现「退出应用时崩」，用 `GPUI_MACOS_TOUCHBAR_GUARD=0` 启动做对照，并把那份 `.ips`
+  交回来。
