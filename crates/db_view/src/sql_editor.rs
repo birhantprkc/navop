@@ -3058,8 +3058,9 @@ mod tests {
     };
     use db::sql_editor::statement_ranges::{SqlDialect, SqlStatementSnapshot};
     use gpui::{
-        App, AppContext as _, Context, Entity, IntoElement, Modifiers, MouseButton,
-        ParentElement as _, Render, Styled as _, Subscription, VisualTestContext, Window, div,
+        App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
+        Modifiers, MouseButton, ParentElement as _, Render, Styled as _, Subscription,
+        VisualTestContext, Window, div,
     };
     use gpui_component::highlighter::DiagnosticSeverity;
     use gpui_component::input::{
@@ -3068,7 +3069,9 @@ mod tests {
     use gpui_component::{Rope, RopeExt};
     use lsp_types::{CompletionItemKind, ShowDocumentParams};
     use one_core::settings::AppSettings;
-    use one_core::tab_container::{GlobalTabContainer, TabContainer};
+    use one_core::tab_container::{
+        GlobalTabContainer, TabContainer, TabContent, TabContentEvent, TabItem,
+    };
     use std::collections::HashMap;
     use std::{cell::RefCell, rc::Rc, sync::Arc};
 
@@ -3567,6 +3570,131 @@ mod tests {
             let tabs = tab_ids(&tab_container, cx);
             assert_eq!(1, tabs.len());
             assert_eq!("sql-object-details:app.public:table:users", tabs[0].0);
+        });
+    }
+
+    /// 桩页签：被取消激活时回头去改编辑器，复刻 `SqlEditorTab::on_deactivate`
+    /// 的行为（先改 `SqlEditor` 视图，再由它改到编辑器输入状态）。
+    struct DeactivatingEditorStub {
+        view: Entity<SqlEditor>,
+        focus_handle: FocusHandle,
+    }
+
+    impl EventEmitter<TabContentEvent> for DeactivatingEditorStub {}
+
+    impl Focusable for DeactivatingEditorStub {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl gpui::Render for DeactivatingEditorStub {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui::div()
+        }
+    }
+
+    impl TabContent for DeactivatingEditorStub {
+        fn content_key(&self) -> &'static str {
+            "DeactivatingEditorStub"
+        }
+
+        fn title(&self, _cx: &App) -> gpui::SharedString {
+            "stub".into()
+        }
+
+        fn on_deactivate(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+            self.view.update(cx, |editor, cx| {
+                editor.invalidate_metadata_context(cx);
+                editor.invalidate_completions(cx);
+            });
+        }
+    }
+
+    /// 让宿主编容器里站着一个「被取消激活就去改编辑器」的页签。
+    ///
+    /// 真实场景就是 SQL 编辑器页签：Cmd/Ctrl+点击时它就是宿主编容器里
+    /// 当前的页签，开详情页签会先把它取消激活。
+    fn host_with_deactivating_tab(fixture: &SqlEditorFixture, visual: &mut VisualTestContext) {
+        let view = fixture.editor.clone();
+        let host = fixture.tab_container.clone();
+        visual.update(|_window, cx| {
+            let stub = cx.new(|cx| DeactivatingEditorStub {
+                view,
+                focus_handle: cx.focus_handle(),
+            });
+            host.update(cx, |container, cx| {
+                container.add_and_activate_tab(TabItem::new("stub", "stub", stub), cx);
+            });
+        });
+    }
+
+    /// `select * from users` 里 `users` 的对象详情。
+    fn users_table_details() -> crate::sql_editor_hover::SqlObjectDetails {
+        crate::sql_editor_hover::resolve_object_details(
+            "select * from users",
+            "select * from ".len() + 1,
+            &users_schema(),
+        )
+        .expect("details should resolve")
+    }
+
+    #[gpui::test]
+    fn object_details_open_leaves_the_requesting_input_update_first(cx: &mut gpui::TestAppContext) {
+        // Cmd/Ctrl+点击这条路径：`go_to_definition` 是在编辑器输入状态自己的
+        // update 里回调进 `show_document` 的，同步开页签必然 double-lease。
+        let (fixture, visual) = editor_over_users_table(cx);
+        host_with_deactivating_tab(&fixture, visual);
+        let input = visual.read(|cx| fixture.editor.read(cx).input());
+        let details = users_table_details();
+        let host = fixture.tab_container.clone();
+
+        let opened = visual.update(|window, cx| {
+            input.update(cx, |_state, cx| {
+                crate::sql_object_details_tab::open_object_details_tab(
+                    &details,
+                    Some(host.clone()),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(opened, "有宿主容器时应当接住详情页签");
+
+        visual.read(|cx| {
+            let tabs = details_tabs(&fixture, cx);
+            assert_eq!(2, tabs.len(), "详情页签要和宿主的当前页签并排");
+            assert_eq!("sql-object-details:app.public:table:users", tabs[1].0);
+        });
+    }
+
+    #[gpui::test]
+    fn object_details_open_leaves_the_requesting_editor_update_first(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // 右键菜单这条路径：动作由 `cx.listener` 派发，也就是在 `SqlEditor`
+        // 自己的 update 里；取消激活时被改的正是它。
+        let (fixture, visual) = editor_over_users_table(cx);
+        host_with_deactivating_tab(&fixture, visual);
+        let details = users_table_details();
+        let host = fixture.tab_container.clone();
+
+        let opened = visual.update(|window, cx| {
+            fixture.editor.update(cx, |_editor, cx| {
+                crate::sql_object_details_tab::open_object_details_tab(
+                    &details,
+                    Some(host.clone()),
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert!(opened, "有宿主容器时应当接住详情页签");
+
+        visual.read(|cx| {
+            let tabs = details_tabs(&fixture, cx);
+            assert_eq!(2, tabs.len(), "详情页签要和宿主的当前页签并排");
+            assert_eq!("sql-object-details:app.public:table:users", tabs[1].0);
         });
     }
 

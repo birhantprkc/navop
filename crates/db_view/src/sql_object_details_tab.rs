@@ -39,6 +39,13 @@ pub fn object_details_tab_id(object_id: &str) -> String {
 /// container rather than the window-level tab bar. Embedded editors (`host` is
 /// `None`) fall back to the window container.
 ///
+/// The tab is added on the next effect cycle rather than on the spot: the
+/// Cmd/Ctrl+click entry point runs inside the editor input's own `update`
+/// (`InputBaseState::go_to_definition`), and activating a tab first deactivates
+/// the one that is active - the SQL editor tab's `on_deactivate` writes back
+/// into that same input state, which would be a double lease. Deferring lets
+/// every entity leave the stack first.
+///
 /// Returns `false` when neither container is available (an editor outside any
 /// window container).
 pub fn open_object_details_tab(
@@ -54,6 +61,19 @@ pub fn open_object_details_tab(
     let Some(container) = container else {
         return false;
     };
+    let details = details.clone();
+    window.defer(cx, move |window, cx| {
+        add_object_details_tab(&details, &container, window, cx);
+    });
+    true
+}
+
+fn add_object_details_tab(
+    details: &SqlObjectDetails,
+    container: &Entity<TabContainer>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let tab_id = object_details_tab_id(&details.id);
     let markdown: SharedString = details.markdown.clone().into();
     let title: SharedString = t!(
@@ -74,7 +94,6 @@ pub fn open_object_details_tab(
             cx,
         );
     });
-    true
 }
 
 fn object_details_icon(kind: SqlObjectDetailsKind) -> IconName {
