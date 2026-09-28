@@ -4,6 +4,60 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 
 <!-- NAVOP_RELEASES -->
 
+## [v0.19.3] - 2026-09-28
+
+#### 更新内容
+
+- SSH 支持「密码 + 密钥」组合认证（MFA password,publickey）：防火墙、交换机等设备把 AuthenticationMethods 配成 password,publickey 后，必须在同一条连接上依次通过两个因素，此前只能二选一，这类设备必然登录失败。新增的认证方式由服务器决定因素顺序，password,publickey 与 publickey,password 两种设备都能登录；目标机与跳板机各自可选，数据库隧道、终端、SFTP、端口转发等入口一并支持。
+- SQL 编辑器的「查看对象详情」不再弹独立窗口，改为在数据库页签内打开只读页签：Cmd/Ctrl+点击标识符或右键菜单都能打开，同一对象重复打开只激活已有页签，页签标题与图标按对象类型区分，内容可选中复制。
+- 数据库树搜索框新增「区分大小写 / 全词 / 正则」三个开关（与 IDEA 一致的 Cc / W / .*）：正则开启时「全词」置灰不可用，正则写错时开关标红并在悬停提示里说明、树里显示「未找到」而不是匹配全部；正则模式下不做行内高亮，避免错误的匹配标记。
+- 打开表设计器时先显示「正在加载表结构…」：首次打开既有表要串行查列、索引、表信息三次，此前这段时间是一片空白表单，看着像坏了。
+- RDP 每个连接新增图形管线开关（自动 / 始终 / 从不）：自动模式在部分环境下画质或性能不理想时可以手工指定。
+
+#### 修复与优化
+
+- 修复 MSSQL 打开设计表后字段栏一片空白的问题：可空列返回的是变长类型，此前一律解码失败，整份列清单又被静默吞掉，界面上只剩一张没有任何提示的空表。现在补齐变长类型解码，加载失败也会推窗口通知。各引擎的自增标记也不再丢失：MSSQL IDENTITY、MySQL AUTO_INCREMENT、PostgreSQL serial 与 identity、SQLite 单列 INTEGER 主键、DuckDB nextval、Oracle 标识列现在都由元数据如实上报，设计器不再退化成靠类型字符串猜。
+- 修复对象详情、悬停浮层和「复制 DDL」生成的建表语句与表设计器不一致的问题：此前用的是本地生成逻辑，产物基本是非法 DDL（双引号引用、缺主键 / 自增 / 引擎 / 字符集 / 注释 / 索引）。现在三处统一调用驱动生成，与表设计器逐字一致；DDL 生成期间显示「DDL 生成中…」，视图、列、函数不再假装有建表语句。
+- 修复大分辨率（如 2724x1530）远程桌面会话约每 500ms 反复重连的问题：同一批脏矩形互相重叠，同一批像素被按 2–3 倍上行，超限后又丢弃待提交的基础帧并重连整个会话。现在合并预算按帧尺寸缩放，队列里已有基础帧时只丢增量，绝不为增量压力丢弃基础帧。
+- 修复数据库树搜索「张开就收不回去」：搜索态下点箭头收起节点后，重建扁平列表又把它展开回来。现在搜索期间的手动收起会生效，命中节点仍会自动展开。
+- 修复数据库树搜索时展开的分支「张开却无节点」：箭头方向取自持久展开状态、子项渲染取自搜索结果，两者不一致。现在搜索态下箭头只反映真正渲染出来的子项，取消搜索后也不再留下错误的展开状态。
+- 修复表设计器选中行的悬停底色盖掉选中高亮：此前鼠标移到选中的行上，选中高亮就消失，移开又回来。现在悬停底色只叠加在未选中行上。
+- 扩展的持久化存储改为真正落盘：此前 host storage 的 get 恒返回空、set 恒成功，扩展写进去的订阅、游标读回来永远是空的，MQTT 扩展的「已保存订阅」实际上从未生效。现在每个扩展有独立的命名空间目录，写入走临时文件加 rename，读不出来的旧文件隔离为 .corrupt，支持 TTL 与体积预算。
+- provider 进程崩溃并被宿主自动重启后，已挂载的 shell 页面原地重挂，不再永久停在「加载失败，请关闭并重开连接」；重启还没落地时会等下一次事件，不抢跑。
+- provider 异常退出时记录退出码与 stderr 尾部（含 error / panic / fatal 等关键行），并随重启、自愈被禁用、重启预算耗尽三类日志一起输出，崩溃排查不再只能靠猜。
+- 工作台区分「provider 暂时不可用」与真正的协议错误：前者标记为可重试（宿主会自动重启 provider），后者仍按协议错误上报，调用方不再一概收到 PROTOCOL_ERROR 而无法决定是重试还是报错。
+- 修复出站消息超过协议帧上限时报成「连接莫名断开」：超限帧在写出任何字节之前就被拒绝，连接本身仍然可用，现在明确提示消息过大；入站超限也从 debug 提到 warn，并说明连接随后会被关闭。
+- macOS：带 Touch Bar 的机型上关闭弹窗不再闪退。上一版把「确定 / 取消」那条关闭路径收口之后，点原生红点仍会崩——区别在于那次销毁是 AppKit 在自己的关闭流程里发起的。现在弹窗关闭一律只隐藏并结束会话、不再销毁原生窗口，红点与 Cmd-W 走同一个漏斗。
+
+国内下载：如果 GitHub 下载较慢，可从 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases/tag/v0.19.3) 下载桌面端安装包
+
+---
+
+#### What's New
+
+- SSH now supports combined "password + private key" authentication (MFA password,publickey): firewalls and switches configured with AuthenticationMethods password,publickey must pass two factors on the same connection, and picking one method at a time always failed on such devices. The server decides the factor order, so both password,publickey and publickey,password devices work; the option is available for the target host and the jump host separately, and database tunnels, terminals, SFTP and port forwarding all support it.
+- "View object details" in the SQL editor no longer opens a separate window; it opens a read-only tab inside the database tab. Cmd/Ctrl+click on an identifier and the context menu both work, reopening the same object activates the existing tab, the title and icon follow the object type, and the content stays selectable.
+- The database tree search box gains "match case / whole word / regex" toggles (Cc / W / .*, matching IDEA). With regex on, "whole word" is disabled; an invalid pattern marks the regex toggle red, explains it in a tooltip and shows "not found" in the tree instead of matching everything; inline highlighting is skipped in regex mode to avoid misleading marks.
+- Opening the table designer now shows "Loading table structure…": the first open of an existing table runs three serial queries (columns, indexes, table info) and used to leave a blank form that looked broken.
+- RDP connections gain a graphics pipeline switch (auto / always / never) per connection, for environments where the automatic mode is not the right choice for quality or performance.
+
+#### Fixes and Improvements
+
+- Fixed the blank field list when opening a table designer on MSSQL: nullable columns come back as variable-length types that failed to decode, and the whole column list was then silently swallowed, leaving an empty table with no message at all. Variable-length types now decode, and a failed load raises a window notification. Auto-increment flags are no longer lost either: MSSQL IDENTITY, MySQL AUTO_INCREMENT, PostgreSQL serial and identity, SQLite single-column INTEGER primary keys, DuckDB nextval and Oracle identity columns are all reported from metadata now, so the designer no longer falls back to guessing from the type name.
+- Fixed the CREATE TABLE produced by object details, the hover popover and "Copy DDL" differing from the table designer: it came from a local generator whose output was effectively invalid DDL (double-quoted identifiers, missing primary key / auto-increment / engine / charset / comments / indexes). All three now call the driver's generator and match the table designer byte for byte, showing "Generating DDL…" while it loads; views, columns and functions no longer pretend to have a CREATE TABLE statement.
+- Fixed high-resolution remote desktop sessions (for example 2724x1530) reconnecting roughly every 500 ms: dirty rectangles inside a batch overlap, the same pixels were pushed two or three times, and exceeding the budget dropped the pending base frame and restarted the whole session. The merge budget now scales with the frame size, and a queued base frame is never dropped because of delta pressure.
+- Fixed tree nodes that could not be collapsed while a database search was active: collapsing a branch was undone as soon as the flat list was rebuilt. Manual collapses during a search now stick, while matching nodes still auto-expand.
+- Fixed branches expanded during a database search showing "expanded but empty": the arrow came from the persistent expansion state while the children came from the filtered result. In search mode the arrow now reflects what is actually rendered, and cancelling the search no longer leaves a wrong expansion state behind.
+- Fixed the hover background covering the selection highlight in the table designer: moving the pointer over a selected row used to make the highlight disappear, and moving it away brought it back. The hover background is now only applied to unselected rows.
+- Extension persistent storage now actually writes to disk: host storage used to return an empty value from get and succeed on set, so subscriptions and cursors written by an extension always read back empty — the MQTT extension's saved subscriptions had never worked. Each extension now gets its own namespace directory, writes go through a temporary file plus rename, unreadable files are quarantined as .corrupt, and TTL and size budgets are enforced.
+- After a provider process crashes and the host restarts it, mounted shell pages are remounted in place instead of staying permanently on "loading failed, close and reopen this connection"; a restart that has not landed yet simply waits for the next event.
+- Provider exits now record the exit code and the tail of stderr (including error / panic / fatal lines) and report them alongside restarts, disabled self-healing and exhausted restart budgets, so a crash no longer has to be diagnosed by guesswork.
+- The workbench now distinguishes "provider temporarily unavailable" from a real protocol error: the former is marked retryable (the host restarts the provider automatically) while the latter is still reported as a protocol error, so callers no longer get a blanket PROTOCOL_ERROR and cannot tell whether to retry.
+- Fixed outbound messages over the protocol frame limit being reported as "the connection dropped": an oversized frame is rejected before any byte is written and the connection stays usable, and the error now says the message is too large; inbound overflow was also raised from debug to warn together with the note that the connection is closed afterwards.
+- macOS: closing a dialog no longer crashes on Touch Bar Macs. After the previous release closed the "OK / Cancel" path, clicking the native close button still crashed — the difference is that AppKit initiates that destruction inside its own close flow. Dialogs are now only hidden and their session ended, never destroyed, and the close button and Cmd-W go through the same funnel.
+
+**Full Changelog**: https://github.com/feigeCode/navop/compare/v0.19.2...v0.19.3
+
 ## [v0.19.2] - 2026-09-24
 
 #### 更新内容
