@@ -819,3 +819,35 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
   observation，但没有证据；目前没有别的办法通过「确定 / 取消」这条路径，只能带着这个已知风险。
   真机若再出现「退出应用时崩」，用 `GPUI_MACOS_TOUCHBAR_GUARD=0` 启动做对照，并把那份 `.ips`
   交回来。
+
+### 10.10 不再「跳过」而是「只吸收那一个异常」：守卫重写 + `fork-0.3.121`（2026-09-28 下午）
+
+- 现场不变（同一台 Intel + Touch Bar 机器），「确定 / 取消」那条崩溃路径仍是 §10.9 里那份
+  栈：异常从 `-[_NSTouchBarFinderObservation invalidate]` 出来，被 AppKit 自己的
+  `_crashOnException:` 变成 `SIGILL`。
+- §10.5 的做法是「凡是查找器发起的注销，一律直接 `return`」。**这太重**：KVO 的契约要求合法
+  注册必须可注销，跳过第一次合法注销会留下「已注册、但调用方以为已注销」的观察项 —— 这正是
+  `navop-2026-09-27-165228.ips`（退出应用时 Foundation KVO 记账里 `KERN_INVALID_ADDRESS`）
+  的头号嫌疑。
+- 现在改成：**每一次注销都真的执行**，只吸收「查找器那一次重复注销」产生的异常。
+  - 转发放进 `objc2::exception::catch`（`objc2` 的 `exception` feature，即 C 编译出来的
+    `@try`/`@catch`）。正常返回 ⇒ 注销真的发生了，Foundation 的记账保持一致。
+  - 抛出时只匹配这一种组合：观察者是查找器的、key path 是 `nextResponder`、异常名是
+    `NSRangeException`、reason 含 `because it is not registered as an observer`。匹配 ⇒ 记一条
+    `warn`（观察者类与地址、被观察对象类与地址、key path、context、异常名与 reason）后吸收，
+    这条日志正是真机崩溃报告一直缺的证据（它们的栈止于 raise，没有名字、reason、对象、key path）。
+  - 不匹配 ⇒ 用 `objc2::exception::throw` 原样重抛，让它像从被替换的实现里抛出一样以
+    `C-unwind` 穿过我们。Cocoa 不是异常安全的，网撒太大会把 bug 藏起来而不是修掉。
+- 为什么不用 Rust 的 `catch_unwind`：Rust 抓不了外来异常，让 ObjC 异常穿过 Rust 帧就是 abort；
+  `objc2::exception` 是 C 侧的 `@try`/`@catch`，这才是能接住它的那一层。
+- 验证：`cargo test -p gpui_macos --lib` **16 passed / 0 failed**，其中
+  `the_finders_first_retraction_removes_and_the_duplicate_is_absorbed`（旧版做错的那件事）、
+  `another_key_paths_retraction_is_thrown_back` 与
+  `only_the_unregistered_next_responder_retraction_counts`（把网收窄）、以及 `rethrow` probe
+  （外来异常必须仍以「子进程被异常杀死」的方式可观察）为新增。
+- 已发布 `fork-0.3.121`（快照 `c335307a`，`zed-rev` = `83e4b04b60`），navop 的
+  `[patch.crates-io]` 24 条与 `Cargo.lock` 一并切换；`cargo check -p one-core -p main
+  --all-targets` 通过。
+- 发给真机的第 6 版组合：**不销毁弹窗（§10.7）+ 这一版守卫**。
+- 遗留：`window_teardown` 的「不销毁」现在是这版守卫的兜底；等守卫在真机存活后可以撤销，
+  让原生窗口重新被释放（停放窗口的内存代价随之消失）。
