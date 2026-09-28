@@ -822,32 +822,51 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
 
 ### 10.10 不再「跳过」而是「只吸收那一个异常」：守卫重写 + `fork-0.3.121`（2026-09-28 下午）
 
-- 现场不变（同一台 Intel + Touch Bar 机器），「确定 / 取消」那条崩溃路径仍是 §10.9 里那份
-  栈：异常从 `-[_NSTouchBarFinderObservation invalidate]` 出来，被 AppKit 自己的
-  `_crashOnException:` 变成 `SIGILL`。
 - §10.5 的做法是「凡是查找器发起的注销，一律直接 `return`」。**这太重**：KVO 的契约要求合法
   注册必须可注销，跳过第一次合法注销会留下「已注册、但调用方以为已注销」的观察项 —— 这正是
   `navop-2026-09-27-165228.ips`（退出应用时 Foundation KVO 记账里 `KERN_INVALID_ADDRESS`）
-  的头号嫌疑。
-- 现在改成：**每一次注销都真的执行**，只吸收「查找器那一次重复注销」产生的异常。
-  - 转发放进 `objc2::exception::catch`（`objc2` 的 `exception` feature，即 C 编译出来的
-    `@try`/`@catch`）。正常返回 ⇒ 注销真的发生了，Foundation 的记账保持一致。
+  的头号嫌疑。独立探针证实了这一点：守卫开着时，本该结束通知的那次注销没有生效。
+- 于是改成：**每一次注销都真的执行**，只吸收「查找器那一次重复注销」产生的异常。
   - 抛出时只匹配这一种组合：观察者是查找器的、key path 是 `nextResponder`、异常名是
     `NSRangeException`、reason 含 `because it is not registered as an observer`。匹配 ⇒ 记一条
     `warn`（观察者类与地址、被观察对象类与地址、key path、context、异常名与 reason）后吸收，
     这条日志正是真机崩溃报告一直缺的证据（它们的栈止于 raise，没有名字、reason、对象、key path）。
-  - 不匹配 ⇒ 用 `objc2::exception::throw` 原样重抛，让它像从被替换的实现里抛出一样以
-    `C-unwind` 穿过我们。Cocoa 不是异常安全的，网撒太大会把 bug 藏起来而不是修掉。
-- 为什么不用 Rust 的 `catch_unwind`：Rust 抓不了外来异常，让 ObjC 异常穿过 Rust 帧就是 abort；
-  `objc2::exception` 是 C 侧的 `@try`/`@catch`，这才是能接住它的那一层。
-- 验证：`cargo test -p gpui_macos --lib` **16 passed / 0 failed**，其中
-  `the_finders_first_retraction_removes_and_the_duplicate_is_absorbed`（旧版做错的那件事）、
+  - 不匹配 ⇒ 原样重抛，让它像从被替换的实现里抛出一样以 `C-unwind` 穿过我们。Cocoa 不是异常
+    安全的，网撒太大会把 bug 藏起来而不是修掉。
+- 验证：`cargo test -p gpui_macos --lib` **16 passed / 0 failed**；新增
+  `the_finders_first_retraction_removes_and_the_duplicate_is_absorbed`（旧版做错的那件事，含
+  「通知计数」双向证明：注册期间有一次通知、注销后不再有）、
   `another_key_paths_retraction_is_thrown_back` 与
-  `only_the_unregistered_next_responder_retraction_counts`（把网收窄）、以及 `rethrow` probe
-  （外来异常必须仍以「子进程被异常杀死」的方式可观察）为新增。
-- 已发布 `fork-0.3.121`（快照 `c335307a`，`zed-rev` = `83e4b04b60`），navop 的
-  `[patch.crates-io]` 24 条与 `Cargo.lock` 一并切换；`cargo check -p one-core -p main
-  --all-targets` 通过。
-- 发给真机的第 6 版组合：**不销毁弹窗（§10.7）+ 这一版守卫**。
+  `only_the_unregistered_next_responder_retraction_counts`（把网收窄）、以及 `rethrow` probe。
+- ⚠️ **单测绿不等于真机可用**：`fork-0.3.121` 的 `@try`/`@catch` 用的是
+  `objc2::exception::catch`，它把 Rust 闭包包在 `@try` 里。**navop 的 `[profile.release]` 是
+  `panic = "abort"`**（为了省 `__eh_frame` / `__gcc_except_tab`，见 `Cargo.toml:311`），这种
+  构建下 ObjC 的 unwind 穿过一个 Rust 帧会变成 `panic in a function that cannot unwind` 并
+  直接 abort。独立探针（`/tmp/navop-guard-release-check`，`#[path]` 引入真实守卫源码 + 与 navop
+  一致的 release profile）复现：dev 构建能吸收重复注销，换成 release 配置后同一操作退出码
+  **134**，`@catch` 根本没执行。**cargo 对 test/bench profile 忽略 `panic` 设置**，所以 16 个
+  单测全过和 release 包会死可以同时成立。
+
+### 10.11 把 `@try`/`@catch` 挪到 ObjC 里编译：`fork-0.3.122`（2026-09-28 傍晚）
+
+- 修法：`@try`/`@catch` 由 crate 自己编译的 Objective-C 实现
+  （`crates/gpui_macos/objc/gpui_macos_try_remove.m`，`build.rs` 用 `cc` 编译），它的 `@try`
+  体里**直接调用原实现**，raise 与 `@catch` 之间没有任何 Rust 帧 —— 于是与构建的 panic 策略
+  无关。shim 返回被 retain 的异常对象，Rust 侧照旧判断：是查找器的重复注销就吸收 + 记 warn，
+  其余交给 shim 的 `@throw` 原样抛回去（仍以 `C-unwind` 穿过被替换的实现）。
+- 同时把 `objc2` 的 `exception` feature 关掉：树里已经没人用它，留着只会把同一个 abort 再请回来。
+- 验证（全部在当前树上重跑）：
+  - 独立探针 + **navop 的 release profile**：新 shim 吸收重复注销并打出
+    `absorbed the Touch Bar finder's duplicate retraction … NSRangeException: Cannot remove an
+    observer … because it is not registered as an observer`，通知计数 `before=1 / after=1`
+    （注销真的生效），进程正常退出。
+  - 同一探针换成 `fork-0.3.121` 的守卫做对照：`panic in a function that cannot unwind` →
+    `thread caused non-unwinding panic. aborting.` → 退出码 **134**。探针确实能检出这个问题。
+  - `cargo test -p gpui_macos --lib` **16 passed / 0 failed**。
+- 已发布 `fork-0.3.122`（快照 `4188a6b2`，`zed-rev` = `283416671d`；已确认快照里带上了
+  `crates/gpui_macos/build.rs`、`objc/gpui_macos_try_remove.m` 与 `cc` build-dependency —— 少
+  任何一个都会在链接期炸掉），navop 的 24 条 `[patch.crates-io]` 与 `Cargo.lock` 一并切换。
+- 发给真机的组合：**不销毁弹窗（§10.7）+ `fork-0.3.122` 的守卫**。
 - 遗留：`window_teardown` 的「不销毁」现在是这版守卫的兜底；等守卫在真机存活后可以撤销，
   让原生窗口重新被释放（停放窗口的内存代价随之消失）。
+
