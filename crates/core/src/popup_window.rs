@@ -35,7 +35,12 @@ fn main_window_handle() -> Option<AnyWindowHandle> {
 ///
 /// 只有通过 [`open_reusable_popup_window`] 打开的弹窗才会登记。没有复用键的一次性弹窗
 /// 登记在 [`PARKED_POPUPS`] 里，两者的关闭动作一致：**隐藏原生窗口，不销毁**。
-static REUSABLE_POPUPS: OnceLock<Mutex<HashMap<&'static str, ReusablePopup>>> = OnceLock::new();
+///
+/// 键是**可携带目标身份**的 `String`（如 `connection-form:ssh:42`），不是 `&'static str`：
+/// 同类弹窗常常同时为不同目标各开一个（同时编辑两个连接、同时连两个远程桌面），
+/// 只按「弹窗种类」复用会把后开的窗口顶掉先开的那个。键与窗口一一对应，所以复用的粒度
+/// 是「同一类弹窗的同一个目标」。
+static REUSABLE_POPUPS: OnceLock<Mutex<HashMap<String, ReusablePopup>>> = OnceLock::new();
 
 /// 一次性弹窗的登记表：窗口 id → 它的内容实体。
 ///
@@ -61,7 +66,7 @@ struct ReusablePopup {
     content: WeakEntity<PopupWindowContent>,
 }
 
-fn reusable_popups() -> &'static Mutex<HashMap<&'static str, ReusablePopup>> {
+fn reusable_popups() -> &'static Mutex<HashMap<String, ReusablePopup>> {
     REUSABLE_POPUPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -70,7 +75,7 @@ fn parked_popups() -> &'static Mutex<HashMap<WindowId, WeakEntity<PopupWindowCon
 }
 
 fn record_reusable_popup(
-    key: &'static str,
+    key: String,
     handle: AnyWindowHandle,
     content: WeakEntity<PopupWindowContent>,
 ) {
@@ -88,7 +93,7 @@ fn record_reusable_popup(
     }
 }
 
-fn forget_reusable_popup(key: &'static str) {
+fn forget_reusable_popup(key: &str) {
     if let Ok(mut slots) = reusable_popups().lock() {
         // 只有真的移除了条目才归还计数：窗口销毁与探活失败可能同时走到这里，
         // 重复扣减会让 `live_windows` 变成负数。
@@ -132,11 +137,11 @@ pub(crate) fn forget_popup_by_window(window_id: WindowId) {
         slots
             .iter()
             .find(|(_, entry)| entry.handle.window_id() == window_id)
-            .map(|(key, _)| *key)
+            .map(|(key, _)| key.clone())
     });
 
     if let Some(key) = key {
-        forget_reusable_popup(key);
+        forget_reusable_popup(&key);
     }
     forget_parked_popup(window_id);
 }
@@ -219,7 +224,14 @@ pub(crate) fn end_popup_session(window: &mut Window, cx: &mut App) {
 ///
 /// **两类弹窗都要装**：一次性弹窗（没登记复用键）同样不能让 AppKit 自己销毁窗口，
 /// 否则「保存连接」这种最常见的一步还是闪退。它们没有复用键，关闭后只是停放在那里。
+///
+/// 未启用 [`crate::window_close::HIDE_WINDOWS_ON_CLOSE`] 的构建（ARM macOS / Windows /
+/// Linux）什么都不装：关闭交回 AppKit 与 GPUI 自己的销毁路径，与加这套机制之前一致。
 fn install_popup_close_routes(window: &mut Window, cx: &mut App) {
+    if !crate::window_close::HIDE_WINDOWS_ON_CLOSE {
+        return;
+    }
+
     // ① 原生关闭（macOS 红点 / 平台层 close）。返回 false 表示「别关」：AppKit 不参与销毁，
     //    窗口交给 `close_window_for_reuse` 隐藏。
     window.on_window_should_close(cx, |window, cx| {
@@ -251,7 +263,7 @@ fn install_popup_close_routes(window: &mut Window, cx: &mut App) {
 /// 探活失败的条目会顺手清掉 —— 窗口可能已经被真正销毁（隐藏失败回落、被系统关掉、
 /// 或退出流程回收），此时返回 `false` 让调用方走新建路径。
 fn reshow_reusable_popup(
-    key: &'static str,
+    key: &str,
     options: &PopupWindowOptions,
     factory: &dyn Fn(&mut Window, &mut App) -> AnyView,
     cx: &mut AsyncApp,
@@ -399,9 +411,11 @@ impl PopupWindowOptions {
 ///
 /// # 关闭行为
 ///
-/// 这个窗口关闭时**只隐藏、不销毁**（见 [`crate::window_close::close_window_for_reuse`]）：
-/// 它是 macOS Touch Bar 机型闪退（navop#308 / navop#314）的修法。没有复用键，所以关闭后
-/// 不会有人重新显示它，下一次打开是新建一个窗口 —— 代价与后续收敛方向见 [`PARKED_POPUPS`]。
+/// 开了 `macos-touchbar-window-hide`（x86_64 macOS 发布包）的构建里，这个窗口关闭时
+/// **只隐藏、不销毁**（见 [`crate::window_close::close_window_for_reuse`]）：它是 macOS
+/// Touch Bar 机型闪退（navop#308 / navop#314）的修法。没有复用键，所以关闭后不会有人
+/// 重新显示它，下一次打开是新建一个窗口 —— 代价与后续收敛方向见 [`PARKED_POPUPS`]。
+/// 其他构建（ARM macOS / Windows / Linux）保持原来的「关闭即销毁」。
 ///
 /// # 参数
 /// - `options`: 窗口配置选项
@@ -449,6 +463,17 @@ pub fn open_popup_window<F, E>(
 /// 与 [`open_popup_window`] 的唯一区别在关闭之后：这个窗口在 macOS 上关闭时只是被隐藏
 /// （配合 [`crate::window_close::close_window_for_reuse`]），下次用同一个 `reuse_key`
 /// 再打开就直接重新显示那个窗口，不再新建，因此原生 NSWindow 从不销毁。
+/// 未启用 `macos-touchbar-window-hide` 的构建里两者行为一致（关闭即销毁）。
+///
+/// # `reuse_key` 怎么取
+///
+/// 复用粒度是「同一类弹窗的**同一个目标**」，所以键要把目标身份带上，别只写弹窗种类：
+///
+/// - `"settings.global-proxy"` —— 全局只有一个的窗口，用常量就够了；
+/// - `format!("connection-form:ssh:{}", id_or_new)` —— 同一类弹窗会为不同连接各开一个，
+///   键里必须带连接身份，否则给 B 打开表单会把 A 的窗口顶掉（同时编辑两个连接是很常见的）。
+///
+/// 键一旦确定就不要再变（同一个键必须始终指同一个目标），否则旧窗口会永远停放在那里。
 ///
 /// # 为什么需要它
 ///
@@ -480,7 +505,7 @@ pub fn open_popup_window<F, E>(
 /// 任何复位逻辑，也不要把「关闭后还能读回上次的输入」当成契约。
 pub fn open_reusable_popup_window<F, E>(
     options: PopupWindowOptions,
-    reuse_key: &'static str,
+    reuse_key: impl Into<String>,
     create_view_fn: F,
     parent_window: Option<&mut Window>,
     cx: &mut App,
@@ -491,7 +516,7 @@ pub fn open_reusable_popup_window<F, E>(
     let factory: Box<dyn Fn(&mut Window, &mut App) -> AnyView> =
         Box::new(move |window, cx| create_view_fn(window, cx).into());
 
-    open_popup_window_inner(options, Some(reuse_key), factory, parent_window, cx);
+    open_popup_window_inner(options, Some(reuse_key.into()), factory, parent_window, cx);
 }
 
 /// [`open_popup_window`] 与 [`open_reusable_popup_window`] 的公共实现。
@@ -500,7 +525,7 @@ pub fn open_reusable_popup_window<F, E>(
 /// 所以窗口只是**停放**在那里（详见 [`PARKED_POPUPS`]）。
 fn open_popup_window_inner(
     options: PopupWindowOptions,
-    reuse_key: Option<&'static str>,
+    reuse_key: Option<String>,
     factory: Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>,
     parent_window: Option<&mut Window>,
     cx: &mut App,
@@ -583,7 +608,7 @@ fn open_popup_window_inner(
         // 复用它：同一个键的弹窗如果只是被隐藏（还活着），用本次的 factory 重建里面的 view
         // 再重新显示，绝不新建 ——「销毁再重建」正是要避开的那条路径
         // （见 `crate::window_close::hide_for_reuse`）。
-        if let Some(key) = reuse_key
+        if let Some(key) = reuse_key.as_deref()
             && reshow_reusable_popup(key, &options, factory.as_ref(), cx)
         {
             return Ok(());
@@ -616,14 +641,18 @@ fn open_popup_window_inner(
             let content = cx.new(|_| {
                 PopupWindowContent::new(view, title, options.hide_titlebar_when_fullscreen)
             });
-            if let Some(key) = reuse_key {
-                record_reusable_popup(key, window.window_handle(), content.downgrade());
-            } else {
-                record_parked_popup(window.window_handle().window_id(), content.downgrade());
+            if crate::window_close::HIDE_WINDOWS_ON_CLOSE {
+                // 登记只在这套机制生效的构建里做：未启用时窗口关闭即销毁，登记表既没用，
+                // 还会让 `forget_popup_by_window` 这类清理逻辑去碰不存在的条目。
+                if let Some(key) = reuse_key {
+                    record_reusable_popup(key, window.window_handle(), content.downgrade());
+                } else {
+                    record_parked_popup(window.window_handle().window_id(), content.downgrade());
+                }
+                // 关闭路线对两类弹窗都要装：一次性弹窗也必须先取消 AppKit 的关闭、再走统一的
+                // 隐藏路线，否则「保存连接」这类最常见的关闭动作在红点路径上还是会闪退。
+                install_popup_close_routes(window, cx);
             }
-            // 关闭路线对两类弹窗都要装：一次性弹窗也必须先取消 AppKit 的关闭、再走统一的
-            // 隐藏路线，否则「保存连接」这类最常见的关闭动作在红点路径上还是会闪退。
-            install_popup_close_routes(window, cx);
             cx.new(|cx| Root::new(content, window, cx))
         })?;
 
@@ -971,6 +1000,51 @@ mod reuse_contract_tests {
             "one-shot popups must be parked in the else branch of the `reuse_key` check: \
              without an entry the close route cannot find their content entity, and reusing a \
              one-shot factory would panic on the second call"
+        );
+    }
+
+    /// **开关只有一个来源**，而且它把整条链路上的每一环都门控了。
+    ///
+    /// 这套机制只在 x86_64 macOS 包里启用（见 `crates/core/Cargo.toml` 的
+    /// `macos-touchbar-window-hide`），其他构建必须逐字退回原行为。漏掉任何一环都会变成
+    /// 半开半关的状态，而且都不报错、只静默退化：
+    /// 登记了却不隐藏（窗口照样销毁，条目永远探活失败，白占内存）、隐藏了却不登记
+    /// （窗口藏起来但业务 view 不卸载，纯泄漏）、装了关闭路线却不隐藏（点红点没反应）。
+    #[test]
+    fn the_hide_switch_gates_every_link_of_the_chain() {
+        assert!(
+            CLOSE_SOURCE.matches("const HIDE_WINDOWS_ON_CLOSE").count() == 1,
+            "the switch must be defined exactly once: two definitions is how builds end up \
+             half-enabled"
+        );
+        assert!(
+            squash_code(CLOSE_SOURCE).contains(
+                "pubconstHIDE_WINDOWS_ON_CLOSE:bool=cfg!(all(target_os=\"macos\",feature=\"macos-touchbar-window-hide\"));"
+            ),
+            "the switch must stay derived from `target_os = \"macos\"` **and** the cargo \
+             feature: Touch Bar only exists on Intel Macs, and a build that forgets the target \
+             check would turn the workaround on for every platform"
+        );
+
+        let hide = body(CLOSE_SOURCE, "pub fn hide_for_reuse");
+        assert!(
+            hide.contains("if !HIDE_WINDOWS_ON_CLOSE"),
+            "hide_for_reuse must refuse to hide in builds that do not opt in, so that the \
+             single close funnel degrades to `remove_window()` as before"
+        );
+
+        let routes = body(POPUP_SOURCE, "fn install_popup_close_routes");
+        assert!(
+            routes.contains("if !crate::window_close::HIDE_WINDOWS_ON_CLOSE"),
+            "install_popup_close_routes must install nothing in builds that do not opt in: \
+             intercepting the native close route without hiding leaves the window un-closable"
+        );
+
+        let opener = squash_code(body(POPUP_SOURCE, "fn open_popup_window_inner"));
+        assert!(
+            opener.contains("ifcrate::window_close::HIDE_WINDOWS_ON_CLOSE{"),
+            "the opener must only register windows in builds that opt in — otherwise the \
+             registries fill up with entries whose windows are destroyed on close"
         );
     }
 }

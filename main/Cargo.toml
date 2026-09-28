@@ -141,6 +141,15 @@ embedded-webview = ["ai_chat_view/embedded-webview"]
 github-distribution = ["github-updates", "github-marketplace"]
 github-marketplace = ["extension-runtime/github-marketplace"]
 github-updates = []
+# `macos-touchbar-window-hide`：关闭窗口只隐藏原生窗口、绝不销毁，规避 Intel Mac 的
+# Touch Bar 闪退（navop#262 / #308 / #314）。**只为 x86_64-apple-darwin 发布包开启**，
+# 其他构建（ARM macOS / Windows / Linux）保持加这套机制之前的「关闭即销毁」。
+#
+# 转发到 `one-core/macos-touchbar-window-hide`：开关本体与代价说明写在
+# `crates/core/Cargo.toml` 的同名 feature 注释里，全链路读同一个常量
+# `one_core::window_close::HIDE_WINDOWS_ON_CLOSE`。打包时由 release workflow 按 target 传入：
+# `cargo build --release -p main --target x86_64-apple-darwin --features macos-touchbar-window-hide`
+macos-touchbar-window-hide = ["one-core/macos-touchbar-window-hide"]
 screenshot-safe = []
 shell-plugins = ["universal-plugins/shell-plugins"]
 wasm-components = ["extension-runtime/wasm-components"]
