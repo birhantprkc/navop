@@ -741,3 +741,49 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
   （不出现「点了没反应、窗口还留在那里」—— 那说明 `orderOut` 之后又被重新显示或激活）。
   底层修法（让 Touch Bar 查找器那次注销根本不抛）仍在 `fork-0.3.118` 的
   `touch_bar_guard.rs` 里，navop 侧这一层是「即使上游守卫漏了一条路也不崩」的兜底。
+
+### 10.8 守卫自己成了崩溃源：两份新 `.ips` 与 `fork-0.3.119`（2026-09-28）
+
+同一台 Intel + Touch Bar 机器（`0.19.2-touchbar-kvo-noop`，`slice_uuid`
+`FA4C5EB5-D6C7-323A-9C47-44C115523372`）交回两份崩溃报告，**都发生在装了 §10.5 那版守卫的
+构建里**，而且都不是守卫原本想挡的那个异常：
+
+- **崩溃 A**（`navop-2026-09-28-083919.ips`）：`EXC_BAD_ACCESS` /
+  `KERN_PROTECTION_FAILURE`，512 帧互相调用的 `removeObserver:forKeyPath:context:`，栈顶
+  撞到栈保护页后 `abort()`。
+  根因是**守卫自己的递归**：`fork-0.3.118` 的实现把「同一个替换 IMP」装在 `NSObject` 和
+  每个自己实现该方法的 `NSResponder` 子类上，转发目标却按**接收者类**现场查找。
+  AppKit 的 `-[NSWindow removeObserver:forKeyPath:context:]` 自己实现了这个方法，并且会
+  `[super …]` 交给 `NSObject` 的实现 —— 而那份实现也已被替换：从窗口进入时，替换 IMP 查到
+  的是窗口的原始实现，调用它，它又从 `super` 回到我们，于是两者交替递归。
+  用 `otool -tvV` 反汇编（release 二进制已 strip，`atos` 无法符号化，只能从帧模式判断）
+  在 `+48322721` 处看到 `callq *0x8(%r9)`，正是那次自调用。
+- **崩溃 B**（`navop-2026-09-27-165228.ips`）：`SIGSEGV`，发生在
+  `-[NSApplication terminate:]` 内部的 Foundation KVO 记账里
+  （`_NSKeyValueObservationInfoGetObservances` / `_NSKVONotifyingOriginalClassForIsa`，
+  收到的是垃圾 isa `0xd00000020`）。**推断**（未证实）：守卫「凡查找器的注销一律跳过」把
+  查找器的 observation 留在被观察对象上，而 KVO 不持有 observer —— 查找器那侧已经丢弃
+  observation 时，注册表里留下的是悬空指针，等退出流程遍历它时踩到。
+
+改法（Zed 侧 `crates/gpui_macos/src/touch_bar_guard.rs`，提交 `b73d4c2b25`）：
+
+- **每个类各自的转发器**：`macro_rules! forwarders!` 生成 `forward_0…forward_7` 与
+  `forwarder(slot)`；`replace()` 在安装前用 `method_getImplementation` 取该类的原始实现，
+  装的是「属于这个类」的转发器，转发目标也就不再依赖接收者是谁。槽位固定 8 个
+  （`SLOTS`/`ORIGINALS`/`SLOTS_TAKEN`），装不下时报错并带上类名。
+- **默认不装**：只有 `GPUI_MACOS_TOUCHBAR_GUARD` 开了才安装（空 / `0` / `false` / `off`
+  视为关）。理由有两条：§10.7 之后弹窗不再销毁，守卫要挡的「视图将死时被注销」已经不复现；
+  而崩溃 B 说明带着守卫反而可能引入新的退出期崩溃。要复现老问题，用环境变量把它打开。
+- 验证：`cargo test -p gpui_macos --lib` **14 passed / 0 failed**，其中新增
+  `a_window_retraction_does_not_call_the_guard_in_a_circle`（窗口发起的注销必须以异常的
+  `SIGABRT` 结束，而不是栈溢出的 `SIGSEGV`）、`the_guard_is_off_unless_the_environment_asks_for_it`、
+  `installing_twice_leaves_the_runtime_alone`；probe 也覆盖了 `PROBE_OFF` 与槽位一致性。
+  clippy 对本 crate 无新增告警（`gpui` crate 里有一处**既有** `redundant_clone` 会中断
+  clippy 构建，只能临时 `-A clippy::redundant_clone` 绕过；与本改动无关）。
+- 已发布 `fork-0.3.119`（快照提交 `36429a19`，`zed-rev` = `b73d4c2b25`），navop 的
+  `[patch.crates-io]` 24 条与 `Cargo.lock` 一并切过去；`cargo check -p one-core -p main
+  --all-targets` 通过。
+- ⚠️ 发出去给真机的那包是「**不销毁弹窗**（§10.7）+ **守卫关闭**」的组合：即最保守、
+  引入最少新机制的形态。老崩溃家族（窗口销毁期被注销）由「不销毁」消除；如果仍偶发，再用
+  `GPUI_MACOS_TOUCHBAR_GUARD=1` 从终端启动来验证「修好的守卫」是否有效 —— 这是两条独立的
+  防线，**不要**在没有真机证据的情况下同时打开。
