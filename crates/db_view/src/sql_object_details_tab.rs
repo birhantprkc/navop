@@ -6,11 +6,13 @@
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, Render, SharedString, Window,
-    div,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, SharedString,
+    Window, div,
 };
 use one_assets::IconName;
-use one_core::tab_container::{GlobalTabContainer, TabContent, TabContentEvent, TabItem};
+use one_core::tab_container::{
+    GlobalTabContainer, TabContainer, TabContent, TabContentEvent, TabItem,
+};
 use rust_i18n::t;
 
 use crate::sql_editor_hover::{SqlObjectDetails, SqlObjectDetailsKind};
@@ -30,17 +32,28 @@ pub fn object_details_tab_id(object_id: &str) -> String {
 }
 
 /// Opens the details tab for `details`, or re-activates it when it is already
-/// open. Returns `false` when the app has no tab container to open into (an
-/// embedded editor outside the main window).
+/// open.
+///
+/// `host` is the tab container the requesting view lives in: details are a
+/// sibling of the SQL editor tab, so they belong in the database tab's inner
+/// container rather than the window-level tab bar. Embedded editors (`host` is
+/// `None`) fall back to the window container.
+///
+/// Returns `false` when neither container is available (an editor outside any
+/// window container).
 pub fn open_object_details_tab(
     details: &SqlObjectDetails,
+    host: Option<Entity<TabContainer>>,
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
-    let Some(global) = cx.try_global::<GlobalTabContainer>() else {
+    let container = host.or_else(|| {
+        cx.try_global::<GlobalTabContainer>()
+            .map(|global| global.primary_pane())
+    });
+    let Some(container) = container else {
         return false;
     };
-    let container = global.primary_pane();
     let tab_id = object_details_tab_id(&details.id);
     let markdown: SharedString = details.markdown.clone().into();
     let title: SharedString = t!(

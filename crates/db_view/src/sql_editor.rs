@@ -38,6 +38,7 @@ use lsp_types::{
 };
 use one_assets::IconName;
 use one_core::settings::{AppSettings, installed_grid_monospace_font};
+use one_core::tab_container::TabContainer;
 use one_ui::{ExtendedEditor, ExtendedEditorState, SignatureHelpProvider};
 use rust_i18n::t;
 use sum_tree::Bias;
@@ -2437,6 +2438,10 @@ pub struct SqlEditor {
     default_hover_provider: Option<Rc<DefaultSqlHoverProvider>>,
     default_signature_help_provider: Option<Rc<DefaultSqlSignatureHelpProvider>>,
     font_cache: Option<SqlEditorFontCache>,
+    /// 宿主页签容器：对象详情页签要开在编辑器所在的那个容器里（数据库页签内部的
+    /// 容器），而不是主窗口的页签栏。由 [`SqlEditorTab`] 在构造时注入；共用一个
+    /// 句柄给 Cmd/Ctrl+点击的处理器。
+    tab_container: Rc<RefCell<Option<Entity<TabContainer>>>>,
 }
 
 struct SqlEditorFontCache {
@@ -2459,7 +2464,9 @@ impl SqlEditor {
         ));
         let default_definition_provider_trait: Rc<dyn DefinitionProvider> =
             default_definition_provider.clone();
-        let show_object_details = sql_object_details_handler(default_definition_provider.clone());
+        let tab_container: Rc<RefCell<Option<Entity<TabContainer>>>> = Rc::new(RefCell::new(None));
+        let show_object_details =
+            sql_object_details_handler(default_definition_provider.clone(), tab_container.clone());
         let default_signature_help_provider =
             Rc::new(DefaultSqlSignatureHelpProvider::new(SqlSchema::default()));
         let default_signature_help_provider_trait: Rc<dyn SignatureHelpProvider> =
@@ -2507,7 +2514,21 @@ impl SqlEditor {
             default_hover_provider: Some(default_hover_provider),
             default_signature_help_provider: Some(default_signature_help_provider),
             font_cache: None,
+            tab_container,
         }
+    }
+
+    /// 注入宿主页签容器（编辑器所在的那个容器）。
+    ///
+    /// 由 [`SqlEditorTab`] 在把自己的编辑器挂进数据库页签容器后调用，这样对象
+    /// 详情页签会开在同一个容器里，而不是主窗口的页签栏。
+    pub fn set_tab_container(&mut self, container: Entity<TabContainer>) {
+        *self.tab_container.borrow_mut() = Some(container);
+    }
+
+    /// 当前宿主页签容器。
+    fn host_tab_container(&self) -> Option<Entity<TabContainer>> {
+        self.tab_container.borrow().clone()
     }
 
     fn editor_font(&mut self, cx: &mut Context<Self>) -> Font {
@@ -2802,7 +2823,12 @@ impl SqlEditor {
             window.push_notification(t!("Query.no_hover_details_at_cursor").to_string(), cx);
             return;
         };
-        crate::sql_object_details_tab::open_object_details_tab(&details, window, cx);
+        crate::sql_object_details_tab::open_object_details_tab(
+            &details,
+            self.host_tab_container(),
+            window,
+            cx,
+        );
     }
 
     /// Copy the generated DDL for the table under the cursor (or in the
@@ -2911,7 +2937,10 @@ impl Render for SqlEditor {
 /// [`crate::sql_editor_definition`]) and open the details tab that the context
 /// menu also uses; anything else returns `false` so normal go-to-definition
 /// behaviour is untouched.
-fn sql_object_details_handler(provider: Rc<DefaultSqlDefinitionProvider>) -> ShowDocumentHandler {
+fn sql_object_details_handler(
+    provider: Rc<DefaultSqlDefinitionProvider>,
+    tab_container: Rc<RefCell<Option<Entity<TabContainer>>>>,
+) -> ShowDocumentHandler {
     Rc::new(move |params, window, cx| {
         if !crate::sql_editor_definition::is_object_details_uri(&params.uri) {
             return false;
@@ -2919,7 +2948,8 @@ fn sql_object_details_handler(provider: Rc<DefaultSqlDefinitionProvider>) -> Sho
         let Some(details) = provider.take_pending_details() else {
             return false;
         };
-        crate::sql_object_details_tab::open_object_details_tab(&details, window, cx);
+        let host = tab_container.borrow().clone();
+        crate::sql_object_details_tab::open_object_details_tab(&details, host, window, cx);
         true
     })
 }
@@ -3201,10 +3231,14 @@ mod tests {
     }
 
     /// Window hosting a SQL editor showing `select * from users` against
-    /// [`users_schema`], plus the app's tab container (details open as tabs).
+    /// [`users_schema`], plus both tab containers the app has: the database
+    /// tab's inner container (where the editor lives) and the window-level one.
     struct SqlEditorFixture {
         editor: Entity<SqlEditor>,
+        /// 数据库页签内部的容器：详情页签应该开在这里。
         tab_container: Entity<TabContainer>,
+        /// 主窗口（外层）页签栏：详情页签不应该开到这里。
+        window_tab_container: Entity<TabContainer>,
         table_range: std::ops::Range<usize>,
     }
 
@@ -3219,15 +3253,23 @@ mod tests {
         let table_range = text.find("users").expect("table name")..text.len();
         let mut sql_editor = None;
         let mut tab_container = None;
+        let mut window_tab_container = None;
         let (_, visual) = cx.add_window_view(|window, cx| {
             let editor = cx.new(|cx| SqlEditor::new(window, cx));
-            // Same wiring as the app: details tabs need the global container.
+            // Same wiring as the app: the editor sits in the database tab's
+            // inner container, while `GlobalTabContainer` holds the window-level
+            // one that must *not* collect the details tabs.
             let container = cx.new(|cx| TabContainer::new(window, cx));
+            let window_container = cx.new(|cx| TabContainer::new(window, cx));
             cx.set_global(GlobalTabContainer {
-                tab_container: container.clone(),
+                tab_container: window_container.clone(),
+            });
+            editor.update(cx, |editor, _| {
+                editor.set_tab_container(container.clone());
             });
             sql_editor = Some(editor.clone());
             tab_container = Some(container);
+            window_tab_container = Some(window_container);
             SqlEditorHarness {
                 editor,
                 _subscription: None,
@@ -3236,6 +3278,7 @@ mod tests {
         let fixture = SqlEditorFixture {
             editor: sql_editor.expect("SQL editor should be created"),
             tab_container: tab_container.expect("tab container should be created"),
+            window_tab_container: window_tab_container.expect("window tab container"),
             table_range,
         };
         VisualTestContext::update(visual, |window, cx| {
@@ -3250,10 +3293,19 @@ mod tests {
         (fixture, visual)
     }
 
-    /// Ids and titles of the tabs currently open in `fixture`'s container.
+    /// Ids and titles of the tabs currently open in `fixture`'s inner
+    /// (database tab) container.
     fn details_tabs(fixture: &SqlEditorFixture, cx: &App) -> Vec<(String, String)> {
-        fixture
-            .tab_container
+        tab_ids(&fixture.tab_container, cx)
+    }
+
+    /// Ids and titles of the tabs currently open in the window-level container.
+    fn window_tabs(fixture: &SqlEditorFixture, cx: &App) -> Vec<(String, String)> {
+        tab_ids(&fixture.window_tab_container, cx)
+    }
+
+    fn tab_ids(container: &Entity<TabContainer>, cx: &App) -> Vec<(String, String)> {
+        container
             .read(cx)
             .tabs()
             .iter()
@@ -3331,12 +3383,21 @@ mod tests {
             "tab title should name the object, got {:?}",
             tabs[0].1
         );
+        // 详情页签是 SQL 编辑器页签的兄弟：必须开在数据库页签内部的容器里，
+        // 不能跑到主窗口的页签栏上。
+        visual.read(|cx| {
+            assert!(
+                window_tabs(&fixture, cx).is_empty(),
+                "details must not open in the window-level tab bar"
+            );
+        });
 
         // Re-resolving the same object must reuse its tab, not stack a copy.
         visual.simulate_mouse_down(point, MouseButton::Left, Modifiers::secondary_key());
         settle(visual);
         visual.read(|cx| {
             assert_eq!(1, details_tabs(&fixture, cx).len(), "details tabs reuse");
+            assert!(window_tabs(&fixture, cx).is_empty());
         });
     }
 
@@ -3361,6 +3422,7 @@ mod tests {
                 details_tabs(&fixture, cx).is_empty(),
                 "a plain click must not open the details tab"
             );
+            assert!(window_tabs(&fixture, cx).is_empty());
             assert_eq!(
                 fixture.table_range.start + fixture.table_range.len() / 2,
                 fixture.editor.read(cx).input().read(cx).cursor(),
@@ -3400,7 +3462,10 @@ mod tests {
         });
 
         assert!(!handled, "only the synthetic details URI belongs to us");
-        visual.read(|cx| assert!(details_tabs(&fixture, cx).is_empty()));
+        visual.read(|cx| {
+            assert!(details_tabs(&fixture, cx).is_empty());
+            assert!(window_tabs(&fixture, cx).is_empty());
+        });
     }
 
     #[test]
@@ -3451,6 +3516,58 @@ mod tests {
         assert_eq!(1, tabs.len(), "the menu entry opens the details tab");
         assert_eq!("sql-object-details:app.public:table:users", tabs[0].0);
         assert!(tabs[0].1.contains("users"));
+        visual.read(|cx| {
+            assert!(
+                window_tabs(&fixture, cx).is_empty(),
+                "the menu entry must open into the database tab as well"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn object_details_fall_back_to_the_window_container_without_a_host(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // 内嵌编辑器（表格单元格里的 SQL 编辑器）没有自己的页签容器，
+        // 只能退回主窗口容器——不能变成一个点了没反应的入口。
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(AppSettings::default());
+        });
+        let mut tab_container = None;
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let container = cx.new(|cx| TabContainer::new(window, cx));
+            cx.set_global(GlobalTabContainer {
+                tab_container: container.clone(),
+            });
+            tab_container = Some(container);
+            SqlEditorHarness {
+                editor: cx.new(|cx| SqlEditor::new(window, cx)),
+                _subscription: None,
+            }
+        });
+        let tab_container = tab_container.expect("tab container should be created");
+        let schema = users_schema();
+        let details = crate::sql_editor_hover::resolve_object_details(
+            "select * from users",
+            "select * from ".len() + 1,
+            &schema,
+        )
+        .expect("details should resolve");
+
+        let opened = visual.update(|window, cx| {
+            crate::sql_object_details_tab::open_object_details_tab(&details, None, window, cx)
+        });
+
+        assert!(
+            opened,
+            "a container-less editor still opens the details tab"
+        );
+        visual.read(|cx| {
+            let tabs = tab_ids(&tab_container, cx);
+            assert_eq!(1, tabs.len());
+            assert_eq!("sql-object-details:app.public:table:users", tabs[0].0);
+        });
     }
 
     #[test]

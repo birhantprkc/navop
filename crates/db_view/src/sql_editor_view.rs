@@ -1344,6 +1344,9 @@ pub struct SqlEditorTabConfig {
     pub initial_database: Option<String>,
     pub initial_schema: Option<String>,
     pub execution_history: Entity<ExecutionHistoryPanel>,
+    /// 编辑器所住的页签容器（数据库页签内部的容器）：对象详情页签要开在这里，
+    /// 而不是主窗口的页签栏。
+    pub tab_container: Entity<TabContainer>,
 }
 
 /// A windowed statement scan plus the buffer rows it covers.
@@ -1545,6 +1548,10 @@ impl SqlEditorTab {
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| SqlEditor::new(window, cx));
+        // 详情页签是编辑器页签的兄弟，必须开在同一个容器里。
+        editor.update(cx, |editor, _| {
+            editor.set_tab_container(config.tab_container.clone());
+        });
         let focus_handle = cx.focus_handle();
         let global_state = cx.global::<GlobalDbState>().clone();
         let execution_history = config.execution_history.clone();
