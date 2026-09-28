@@ -306,7 +306,7 @@ fn extract_scale_from_type_str(data_type: &str) -> Option<u32> {
     None
 }
 
-fn find_loaded_table_info(
+pub(crate) fn find_loaded_table_info(
     tables: Vec<TableInfo>,
     table_name: &str,
     schema_name: Option<&str>,

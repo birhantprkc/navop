@@ -1398,6 +1398,18 @@ Query:
     en: DDL copied to clipboard
     zh-CN: DDL 已复制到剪贴板
     zh-HK: DDL 已複製到剪貼簿
+  object_details_ddl_loading:
+    en: Generating DDL…
+    zh-CN: DDL 生成中…
+    zh-HK: DDL 產生中…
+  object_details_ddl_failed:
+    en: "Failed to generate DDL: %{error}"
+    zh-CN: "生成 DDL 失败: %{error}"
+    zh-HK: "產生 DDL 失敗: %{error}"
+  object_details_view_ddl_unavailable:
+    en: Views have no CREATE TABLE DDL; the columns above come from the metadata.
+    zh-CN: 视图没有建表 DDL，上面的列信息来自元数据。
+    zh-HK: 檢視表沒有建表 DDL，上面的欄位資訊來自中繼資料。
   no_hover_details_at_cursor:
     en: No database object details at the cursor
     zh-CN: 光标处没有可查看的数据库对象详情

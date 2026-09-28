@@ -22,6 +22,7 @@ use lsp_types::{LocationLink, Range as LspRange, Uri};
 use crate::sql_editor_hover::{
     SqlHoverSources, SqlObjectDetails, offset_to_lsp_position, resolve_object_details,
 };
+use crate::table_ddl::TableDdlSources;
 
 /// URI scheme marking a click that should open the object-details window.
 /// Deliberately not http(s): the handler matches on it, and anything that
@@ -94,6 +95,11 @@ impl DefaultSqlDefinitionProvider {
     /// `show_document` handler so one hover yields exactly one window.
     pub(crate) fn take_pending_details(&self) -> Option<SqlObjectDetails> {
         self.pending.borrow_mut().take()
+    }
+
+    /// 建表 DDL 来源：与 hover provider 共用同一份快照，所以在这里读也一样。
+    pub(crate) fn table_ddl(&self) -> Option<TableDdlSources> {
+        self.sources.borrow().table_ddl.clone()
     }
 }
 
@@ -169,7 +175,11 @@ mod tests {
             .expect("details should be primed for the click");
         assert_eq!(details.range, 14..19);
         assert!(details.markdown.contains("**TABLE**"));
-        assert!(details.markdown.contains("CREATE TABLE"));
+        assert_eq!(
+            details.table.map(|table| table.name),
+            Some("users".to_string()),
+            "点击要记住 DDL 坐标，DDL 本体由驱动异步生成"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::sql_editor_definition::DefaultSqlDefinitionProvider;
 use crate::sql_editor_hover::DefaultSqlHoverProvider;
 use crate::sql_editor_signature::DefaultSqlSignatureHelpProvider;
+use crate::table_ddl::{TableDdlSection, TableDdlSources};
 use anyhow::Result;
 use db::plugin::SqlCompletionInfo;
 use db::sql_editor::diagnostics::{
@@ -18,7 +19,7 @@ use db::sql_editor::sql_tokenizer::{SqlKeyword, SqlToken, SqlTokenKind, SqlToken
 use db::sql_editor::statement_ranges::{SqlDialect, SqlStatementSnapshot};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, AppContext, Context, Entity, Font, InteractiveElement as _, IntoElement,
+    App, AppContext, AsyncApp, Context, Entity, Font, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Task, Window, div,
 };
 use gpui_component::WindowExt as _;
@@ -105,12 +106,25 @@ pub struct SqlTableDetail {
 pub struct ForeignSchema {
     /// qualifier 原始名称（保持大小写）。
     pub name: String,
+    /// 拉取这份元数据时用的坐标：它才是表真正所在的 database/schema。
+    /// 跨库限定名（`otherdb.users`）的建表 DDL 要靠它对上驱动查询。
+    pub scope: ForeignSchemaScope,
     /// (表名, 说明)
     pub tables: Vec<(String, String)>,
     /// 表→列映射，每列为 (name, data_type, doc)
     pub columns_by_table: std::collections::HashMap<String, Vec<(String, String, String)>>,
     /// 表名→详细信息（供 hover 复用）。
     pub table_details: std::collections::HashMap<String, SqlTableDetail>,
+}
+
+/// 拉取外部 qualifier 元数据时使用的 (database, schema) 坐标。
+///
+/// database 型 qualifier（MySQL/ClickHouse）落在 database 上，schema 型 qualifier
+/// （PG/MSSQL/Oracle）落在 schema 上，两者都由视图层在拉取时确定。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ForeignSchemaScope {
+    pub database: String,
+    pub schema: Option<String>,
 }
 
 /// Schema hints used by autocomplete and hover.
@@ -2526,6 +2540,23 @@ impl SqlEditor {
         *self.tab_container.borrow_mut() = Some(container);
     }
 
+    /// 注入建表 DDL 的来源（连接 + 方言）。
+    ///
+    /// 由 [`SqlEditorView`] 在发布元数据时调用；嵌在单元格里的编辑器没有连接
+    /// 上下文，那种场景下详情页签不带 DDL 区段。
+    pub fn set_table_ddl_sources(&mut self, sources: Option<TableDdlSources>) {
+        if let Some(provider) = &self.default_hover_provider {
+            provider.set_table_ddl(sources);
+        }
+    }
+
+    /// 当前建表 DDL 来源。
+    fn table_ddl_sources(&self) -> Option<TableDdlSources> {
+        self.default_hover_provider
+            .as_ref()
+            .and_then(|provider| provider.table_ddl())
+    }
+
     /// 当前宿主页签容器。
     fn host_tab_container(&self) -> Option<Entity<TabContainer>> {
         self.tab_container.borrow().clone()
@@ -2805,51 +2836,78 @@ impl SqlEditor {
     /// Resolve the identifier under the cursor (or in the selection) against
     /// the current schema snapshot and open its details tab.
     ///
-    /// Triggered from the editor context menu. With a selection the selection
-    /// body is probed first, so right-clicking a selected table name works even
-    /// when the cursor sits at a selection edge.
+    /// Triggered from the editor context menu and by Cmd/Ctrl+click. With a
+    /// selection the selection body is probed first, so right-clicking a
+    /// selected table name works even when the cursor sits at a selection edge.
     pub fn show_hover_details(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let schema = self.current_schema();
-        let (text, cursor, selection) = self.editor.update(cx, |state, _| {
-            (
-                state.text().to_string(),
-                state.cursor(),
-                Some(state.selected_range()),
-            )
-        });
+        let (text, cursor, selection) = self.editor_snapshot(cx);
         let Some(details) = crate::sql_editor_hover::resolve_object_details_for_selection(
-            &text, selection, cursor, &schema,
+            &text,
+            selection,
+            cursor,
+            &self.current_schema(),
         ) else {
             window.push_notification(t!("Query.no_hover_details_at_cursor").to_string(), cx);
             return;
         };
         crate::sql_object_details_tab::open_object_details_tab(
-            &details,
-            self.host_tab_container(),
+            self.object_details_request(details),
             window,
             cx,
         );
     }
 
-    /// Copy the generated DDL for the table under the cursor (or in the
-    /// selection) to the clipboard. No-op notification when nothing resolves.
+    /// Copy the DDL for the table under the cursor (or in the selection) to the
+    /// clipboard. No-op notification when nothing resolves.
+    ///
+    /// 与[表设计器] (@see SqlEditorView) 同一条驱动链路，所以是异步的：先取
+    /// 元数据再让驱动生成方言正确的建表 DDL。
     pub fn copy_hover_ddl(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let schema = self.current_schema();
-        let (text, cursor, selection) = self.editor.update(cx, |state, _| {
+        let (text, cursor, selection) = self.editor_snapshot(cx);
+        let details = crate::sql_editor_hover::resolve_object_details_for_selection(
+            &text,
+            selection,
+            cursor,
+            &self.current_schema(),
+        );
+        let table = details.and_then(|details| details.table);
+        let Some(table) = table else {
+            window.push_notification(t!("Query.no_hover_details_at_cursor").to_string(), cx);
+            return;
+        };
+        let sources = self.table_ddl_sources();
+        let window_handle = window.window_handle();
+        cx.spawn(async move |_this, cx: &mut AsyncApp| {
+            let section =
+                crate::table_ddl::load_ddl_section(Some(&table), sources.as_ref(), cx).await;
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let message = copy_ddl_message(section, cx);
+                window.push_notification(message, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 编辑器当前的文本、光标与选区。
+    fn editor_snapshot(&self, cx: &mut App) -> (String, usize, Option<Range<usize>>) {
+        self.editor.update(cx, |state, _| {
             (
                 state.text().to_string(),
                 state.cursor(),
                 Some(state.selected_range()),
             )
-        });
-        match crate::sql_editor_hover::build_ddl_for_selection(&text, selection, cursor, &schema) {
-            Some(ddl) => {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(ddl.clone()));
-                window.push_notification(t!("Query.ddl_copied").to_string(), cx);
-            }
-            None => {
-                window.push_notification(t!("Query.no_hover_details_at_cursor").to_string(), cx);
-            }
+        })
+    }
+
+    /// 打开对象详情页签要的请求：对象身份 + DDL 来源 + 宿主编容器。
+    fn object_details_request(
+        &self,
+        details: crate::sql_editor_hover::SqlObjectDetails,
+    ) -> crate::sql_object_details_tab::ObjectDetailsRequest {
+        crate::sql_object_details_tab::ObjectDetailsRequest {
+            details,
+            ddl: self.table_ddl_sources(),
+            host: self.host_tab_container(),
         }
     }
 
@@ -2878,6 +2936,21 @@ impl SqlEditor {
 
     pub fn document_revision(&self, cx: &App) -> u64 {
         self.editor.read(cx).document_revision()
+    }
+}
+
+/// 拿到 DDL 后写进剪贴板，并给出要提示用户的文案。
+fn copy_ddl_message(section: Option<TableDdlSection>, cx: &mut App) -> String {
+    match section {
+        Some(TableDdlSection::Ready(ddl)) => {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(ddl));
+            t!("Query.ddl_copied").to_string()
+        }
+        Some(TableDdlSection::Failed(error)) => {
+            t!("Query.object_details_ddl_failed", error = error.as_str()).to_string()
+        }
+        // 没有连接上下文的内嵌编辑器，或还没生成完：这里没有 DDL 可复制。
+        _ => t!("Query.no_hover_details_at_cursor").to_string(),
     }
 }
 
@@ -2948,8 +3021,12 @@ fn sql_object_details_handler(
         let Some(details) = provider.take_pending_details() else {
             return false;
         };
-        let host = tab_container.borrow().clone();
-        crate::sql_object_details_tab::open_object_details_tab(&details, host, window, cx);
+        let request = crate::sql_object_details_tab::ObjectDetailsRequest {
+            details,
+            ddl: provider.table_ddl(),
+            host: tab_container.borrow().clone(),
+        };
+        crate::sql_object_details_tab::open_object_details_tab(request, window, cx);
         true
     })
 }
@@ -3049,8 +3126,9 @@ fn render_sql_gutter_marker(marker: &GutterMarker) -> gpui::AnyElement {
 mod tests {
     use super::{
         RunCursorStatementSql, RunSelectedSql, SQL_GUTTER_IDLE, ShowHoverDetails, SqlContext,
-        SqlEditor, SqlSchema, analyze_diagnostics_pure, completion_priority, identifier_match_rank,
-        schema_to_metadata_view, sql_diagnostic_to_input, sql_editor_context_menu,
+        SqlEditor, SqlSchema, analyze_diagnostics_pure, completion_priority, copy_ddl_message,
+        identifier_match_rank, schema_to_metadata_view, sql_diagnostic_to_input,
+        sql_editor_context_menu,
     };
     use crate::sql_editor_hover::SqlObjectDetailsKind;
     use db::sql_editor::diagnostics::{
@@ -3072,6 +3150,7 @@ mod tests {
     use one_core::tab_container::{
         GlobalTabContainer, TabContainer, TabContent, TabContentEvent, TabItem,
     };
+    use rust_i18n::t;
     use std::collections::HashMap;
     use std::{cell::RefCell, rc::Rc, sync::Arc};
 
@@ -3559,7 +3638,15 @@ mod tests {
         .expect("details should resolve");
 
         let opened = visual.update(|window, cx| {
-            crate::sql_object_details_tab::open_object_details_tab(&details, None, window, cx)
+            crate::sql_object_details_tab::open_object_details_tab(
+                crate::sql_object_details_tab::ObjectDetailsRequest {
+                    details,
+                    ddl: None,
+                    host: None,
+                },
+                window,
+                cx,
+            )
         });
 
         assert!(
@@ -3652,8 +3739,11 @@ mod tests {
         let opened = visual.update(|window, cx| {
             input.update(cx, |_state, cx| {
                 crate::sql_object_details_tab::open_object_details_tab(
-                    &details,
-                    Some(host.clone()),
+                    crate::sql_object_details_tab::ObjectDetailsRequest {
+                        details,
+                        ddl: None,
+                        host: Some(host.clone()),
+                    },
                     window,
                     cx,
                 )
@@ -3682,8 +3772,11 @@ mod tests {
         let opened = visual.update(|window, cx| {
             fixture.editor.update(cx, |_editor, cx| {
                 crate::sql_object_details_tab::open_object_details_tab(
-                    &details,
-                    Some(host.clone()),
+                    crate::sql_object_details_tab::ObjectDetailsRequest {
+                        details,
+                        ddl: None,
+                        host: Some(host.clone()),
+                    },
                     window,
                     cx,
                 )
@@ -3698,34 +3791,48 @@ mod tests {
         });
     }
 
-    #[test]
-    fn copy_ddl_extracts_sql_block_from_hover_markdown() {
-        let schema = SqlSchema::default()
-            .with_scope(Some("app".into()), Some("public".into()))
-            .with_tables(vec![("users".to_string(), "doc".to_string())])
-            .with_table_detail(
-                "users",
-                crate::sql_editor::SqlTableDetail {
-                    object_type: crate::sql_editor::SqlObjectType::Table,
-                    schema: Some("public".into()),
-                    comment: None,
-                    engine: None,
-                    columns: vec![crate::sql_editor::SqlColumnDetail {
-                        name: "id".into(),
-                        data_type: "INT".into(),
-                        is_nullable: false,
-                        is_primary_key: true,
-                        default_value: None,
-                        comment: None,
-                    }],
-                },
-            );
-        let text = "select * from users";
-        let ddl = crate::sql_editor_hover::build_ddl_for_selection(text, None, text.len(), &schema)
-            .expect("table hover carries a DDL preview");
-        assert!(ddl.starts_with("CREATE TABLE"));
-        assert!(ddl.contains("id INT"));
-        assert!(!ddl.contains("```"));
+    /// 「复制 DDL」写进剪贴板的是驱动生成的 DDL（与表设计器一致），不再从
+    /// hover markdown 里抠代码块。
+    #[gpui::test]
+    fn copy_ddl_writes_the_driver_ddl_to_the_clipboard(cx: &mut gpui::TestAppContext) {
+        const DDL: &str =
+            "CREATE TABLE `users` (\n  `id` INT NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB";
+        let message = cx.update(|cx| {
+            copy_ddl_message(
+                Some(crate::table_ddl::TableDdlSection::Ready(DDL.into())),
+                cx,
+            )
+        });
+        let copied = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+
+        assert_eq!(Some(DDL.to_string()), copied);
+        assert_eq!(t!("Query.ddl_copied").to_string(), message);
+    }
+
+    /// 生成失败或光标不在表上时，不写剪贴板。
+    #[gpui::test]
+    fn copy_ddl_reports_failures_without_touching_the_clipboard(cx: &mut gpui::TestAppContext) {
+        let failed = cx.update(|cx| {
+            copy_ddl_message(
+                Some(crate::table_ddl::TableDdlSection::Failed(
+                    "connection closed".into(),
+                )),
+                cx,
+            )
+        });
+        let missing = cx.update(|cx| copy_ddl_message(None, cx));
+        let copied = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+
+        assert_eq!(
+            t!(
+                "Query.object_details_ddl_failed",
+                error = "connection closed"
+            )
+            .to_string(),
+            failed
+        );
+        assert_eq!(t!("Query.no_hover_details_at_cursor").to_string(), missing);
+        assert_eq!(None, copied, "没有 DDL 时不该动剪贴板");
     }
 
     #[gpui::test]
