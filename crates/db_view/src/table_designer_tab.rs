@@ -3,12 +3,12 @@ use futures::channel::oneshot;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, AsyncApp, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, ListSizingBehavior, MouseButton, ParentElement,
-    Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    UniformListScrollHandle, Window, div, px, uniform_list,
+    Focusable, Hsla, InteractiveElement, IntoElement, ListSizingBehavior, MouseButton,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    Task, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IndexPath, Sizable, Size, WindowExt,
+    ActiveTheme, Icon, IndexPath, Sizable, Size, Theme, WindowExt,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     clipboard::Clipboard,
@@ -85,6 +85,20 @@ const COLUMN_EDITOR_MAX_WIDTHS: [Pixels; COLUMN_EDITOR_COLUMN_COUNT] = [
     px(120.0),
     px(140.0),
 ];
+
+/// 列/索引行的选中底色透明度。
+const SELECTED_ROW_BACKGROUND_OPACITY: f32 = 0.1;
+/// 列/索引行的悬停底色透明度。
+const HOVERED_ROW_BACKGROUND_OPACITY: f32 = 0.3;
+
+/// 行悬停时叠加的底色。
+///
+/// 选中的行返回 `None`：悬停样式是在基础样式之后 refine 的，一旦叠加就会把选中
+/// 底色整个盖掉，看起来就像「鼠标移到这一行，高亮没了」。树视图同样只在未选中
+/// 的行上叠加悬停底色。
+fn row_hover_background(is_selected: bool, theme: &Theme) -> Option<Hsla> {
+    (!is_selected).then(|| theme.muted.opacity(HOVERED_ROW_BACKGROUND_OPACITY))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DesignerTab {
@@ -2816,8 +2830,13 @@ impl ColumnsEditor {
             .gap_3()
             .px_3()
             .py_1p5()
-            .when(is_selected, |this| this.bg(cx.theme().primary.opacity(0.1)))
-            .hover(|this| this.bg(cx.theme().muted.opacity(0.3)))
+            .when(is_selected, |this| {
+                this.bg(cx.theme().primary.opacity(SELECTED_ROW_BACKGROUND_OPACITY))
+            })
+            .when_some(
+                row_hover_background(is_selected, cx.theme()),
+                |this, background| this.hover(move |style| style.bg(background)),
+            )
             .border_b_1()
             .border_color(cx.theme().border.opacity(0.5))
             .on_mouse_down(
@@ -3334,8 +3353,13 @@ impl Render for IndexesEditor {
                             .gap_3()
                             .px_3()
                             .py_1p5()
-                            .when(is_selected, |this| this.bg(cx.theme().primary.opacity(0.1)))
-                            .hover(|this| this.bg(cx.theme().muted.opacity(0.3)))
+                            .when(is_selected, |this| {
+                                this.bg(cx.theme().primary.opacity(SELECTED_ROW_BACKGROUND_OPACITY))
+                            })
+                            .when_some(
+                                row_hover_background(is_selected, cx.theme()),
+                                |this, background| this.hover(move |style| style.bg(background)),
+                            )
                             .border_b_1()
                             .border_color(cx.theme().border.opacity(0.5))
                             .on_mouse_down(
@@ -3652,6 +3676,7 @@ mod tests {
         clickhouse::ClickHousePlugin, mssql::MsSqlPlugin, mysql::MySqlPlugin, oracle::OraclePlugin,
         plugin::DatabasePlugin, postgresql::PostgresPlugin, sqlite::SqlitePlugin,
     };
+    use gpui_component::{Theme, ThemeColor};
     use std::{cell::Cell, rc::Rc};
 
     /// 表设计器 DDL 断言仅覆盖仍带原生插件的数据库类型。
@@ -3693,6 +3718,23 @@ mod tests {
         ColumnsEditor::resize_column_width(&mut widths, COLUMN_EDITOR_COLUMN_COUNT, px(260.0));
 
         assert_eq!(COLUMN_EDITOR_DEFAULT_WIDTHS, widths);
+    }
+
+    #[test]
+    fn hovering_a_selected_row_keeps_the_selection_highlight() {
+        let theme = Theme::from(ThemeColor::dark().as_ref());
+
+        // 选中行不叠加悬停底色：悬停样式在基础样式之后 refine，一旦叠加就会
+        // 把选中底色盖掉，看起来像「鼠标移到这一行，高亮没了」。
+        assert_eq!(None, row_hover_background(true, &theme));
+        assert_eq!(
+            Some(theme.muted.opacity(HOVERED_ROW_BACKGROUND_OPACITY)),
+            row_hover_background(false, &theme)
+        );
+        assert_ne!(
+            row_hover_background(true, &theme),
+            row_hover_background(false, &theme)
+        );
     }
 
     fn build_col(name: &str) -> ColumnDefinition {
