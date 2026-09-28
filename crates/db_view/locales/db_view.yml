@@ -957,6 +957,10 @@ Table:
     en: Loading table structure…
     zh-CN: 正在加载表结构…
     zh-HK: 正在載入表結構…
+  load_structure_failed:
+    en: "Failed to load table structure: %{error}"
+    zh-CN: "加载表结构失败：%{error}"
+    zh-HK: "載入表結構失敗：%{error}"
   table_name:
     en: Table Name
     zh-CN: 表名

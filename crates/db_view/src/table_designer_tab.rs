@@ -218,20 +218,13 @@ fn column_info_to_definition(
     parsed: ParsedColumnType,
     primary_key_count: usize,
 ) -> ColumnDefinition {
+    let is_auto_increment =
+        column_is_auto_increment(&database_type, col, &parsed, primary_key_count);
     let base_type = parsed.base_type;
     let data_type = if let Some(enum_values) = parsed.enum_values {
         format!("{}({})", base_type, enum_values)
     } else {
         base_type.clone()
-    };
-    // SQLite 没有独立的自增元数据：仅当主键是「单列 INTEGER 主键」时才是 rowid 别名，
-    // 才允许当作自增；联合主键（含 WITHOUT ROWID 表）不成立。
-    let is_auto_increment = if matches!(database_type, DatabaseType::SQLite) {
-        col.is_primary_key
-            && base_type.eq_ignore_ascii_case("INTEGER")
-            && primary_key_count == 1
-    } else {
-        parsed.is_auto_increment
     };
 
     ColumnDefinition {
@@ -249,6 +242,28 @@ fn column_info_to_definition(
         charset: col.charset.clone(),
         collation: col.collation.clone(),
     }
+}
+
+/// 某列在设计器里是否算自增列。
+///
+/// 优先信元数据：各插件已按引擎语义填好 `is_auto_increment`（MSSQL IDENTITY、MySQL EXTRA、
+/// PG serial/identity）；元数据没给时，SQLite 按「单列 INTEGER 主键 = rowid 别名」兜底
+/// （联合主键、WITHOUT ROWID 表都不算），其它引擎退回类型字符串解析。
+fn column_is_auto_increment(
+    database_type: &DatabaseType,
+    col: &ColumnInfo,
+    parsed: &ParsedColumnType,
+    primary_key_count: usize,
+) -> bool {
+    if col.is_auto_increment {
+        return true;
+    }
+    if matches!(database_type, DatabaseType::SQLite) {
+        return col.is_primary_key
+            && parsed.base_type.eq_ignore_ascii_case("INTEGER")
+            && primary_key_count == 1;
+    }
+    parsed.is_auto_increment
 }
 
 fn fallback_parse_column_type(data_type: &str) -> ParsedColumnType {
@@ -1245,6 +1260,16 @@ impl TableDesigner {
                             error = %error,
                             "[table_designer_diag] load_table_structure Tokio task failed"
                         );
+                        let message = t!("Table.load_structure_failed", error = error.to_string())
+                            .to_string();
+                        let _ = cx.update(|cx| {
+                            if let Some(window_id) = cx.active_window() {
+                                cx.update_window(window_id, |_entity, window, cx| {
+                                    window.push_notification(message.clone(), cx);
+                                })
+                                .ok();
+                            }
+                        });
                         let _ = this.update(cx, |designer, cx| {
                             designer.finish_structure_load(cx);
                         });
@@ -1267,8 +1292,30 @@ impl TableDesigner {
             let _ = cx.update(|cx| {
                 if let Some(window_id) = cx.active_window() {
                     cx.update_window(window_id, |_entity, window, cx| {
-                        let columns = columns_result.ok();
-                        let indexes = indexes_result.ok();
+                        // 元数据读取失败时必须可见：否则设计器只剩表头，
+                        // 用户看到空网格却不知道发生了错误。
+                        let mut failures: Vec<String> = Vec::new();
+                        let columns = match columns_result {
+                            Ok(columns) => Some(columns),
+                            Err(error) => {
+                                failures.push(error.to_string());
+                                None
+                            }
+                        };
+                        let indexes = match indexes_result {
+                            Ok(indexes) => Some(indexes),
+                            Err(error) => {
+                                failures.push(error.to_string());
+                                None
+                            }
+                        };
+                        if !failures.is_empty() {
+                            window.push_notification(
+                                t!("Table.load_structure_failed", error = failures.join("; "))
+                                    .to_string(),
+                                cx,
+                            );
+                        }
                         let table_info = tables_result.ok().and_then(|tables| {
                             find_loaded_table_info(tables, &table_name, schema_name.as_deref())
                         });
@@ -2569,15 +2616,12 @@ impl ColumnsEditor {
                 scale_input,
                 nullable: col.is_nullable,
                 is_pk: col.is_primary_key,
-                auto_increment: if matches!(self.database_type, DatabaseType::SQLite) {
-                    // 仅单列 INTEGER 主键是 rowid 别名（SQLite 的隐式自增）；
-                    // 联合主键（含 WITHOUT ROWID 表）不能勾选自增。
-                    col.is_primary_key
-                        && parsed_type.base_type.eq_ignore_ascii_case("INTEGER")
-                        && primary_key_count == 1
-                } else {
-                    parsed_type.is_auto_increment
-                },
+                auto_increment: column_is_auto_increment(
+                    &self.database_type,
+                    &col,
+                    &parsed_type,
+                    primary_key_count,
+                ),
                 is_unsigned: parsed_type.is_unsigned,
                 default_input,
                 comment_input,
@@ -4940,6 +4984,7 @@ mod tests {
             comment: Some("会话ID".to_string()),
             charset: Some("utf8mb4".to_string()),
             collation: Some("utf8mb4_general_ci".to_string()),
+            is_auto_increment: false,
         };
         let parsed = MySqlPlugin::new().parse_column_type(&column.data_type);
 
@@ -4964,6 +5009,7 @@ mod tests {
             comment: None,
             charset: None,
             collation: None,
+            is_auto_increment: false,
         };
         let enum_col = ColumnInfo {
             name: "status".to_string(),
@@ -4974,6 +5020,7 @@ mod tests {
             comment: None,
             charset: Some("utf8mb4".to_string()),
             collation: Some("utf8mb4_bin".to_string()),
+            is_auto_increment: false,
         };
 
         let numeric_definition = column_info_to_definition(
@@ -4993,6 +5040,61 @@ mod tests {
         assert_eq!(numeric_definition.length, Some(11));
         assert_eq!(enum_definition.data_type, "enum('todo','done')");
         assert_eq!(enum_definition.collation.as_deref(), Some("utf8mb4_bin"));
+    }
+
+    #[test]
+    fn test_column_info_to_definition_prefers_metadata_auto_increment() {
+        // MSSQL 的 IDENTITY 在类型字符串里没有任何痕迹，只能来自元数据；
+        // 以前这里只认类型字符串解析，设计器就会丢掉 IDENTITY。
+        let identity = ColumnInfo {
+            name: "id".to_string(),
+            data_type: "bigint".to_string(),
+            is_nullable: false,
+            is_primary_key: true,
+            default_value: None,
+            comment: None,
+            charset: None,
+            collation: None,
+            is_auto_increment: true,
+        };
+        let parsed = MsSqlPlugin::new().parse_column_type(&identity.data_type);
+        assert!(
+            !parsed.is_auto_increment,
+            "类型字符串解析不出 IDENTITY，这正是必须读元数据的原因"
+        );
+
+        let definition = column_info_to_definition(DatabaseType::MSSQL, &identity, parsed, 1);
+
+        assert!(
+            definition.is_auto_increment,
+            "元数据的自增标记必须传导到设计"
+        );
+    }
+
+    #[test]
+    fn test_column_info_to_definition_sqlite_rowid_alias_fallback() {
+        // 旧来源没填元数据时，SQLite 仍按「单列 INTEGER 主键 = rowid 别名」兜底。
+        let column = ColumnInfo {
+            name: "id".to_string(),
+            data_type: "INTEGER".to_string(),
+            is_nullable: false,
+            is_primary_key: true,
+            default_value: None,
+            comment: None,
+            charset: None,
+            collation: None,
+            is_auto_increment: false,
+        };
+        let parsed = SqlitePlugin::new().parse_column_type(&column.data_type);
+
+        let single_pk = column_info_to_definition(DatabaseType::SQLite, &column, parsed.clone(), 1);
+        let composite_pk = column_info_to_definition(DatabaseType::SQLite, &column, parsed, 2);
+
+        assert!(
+            single_pk.is_auto_increment,
+            "单列 INTEGER 主键是 rowid 别名"
+        );
+        assert!(!composite_pk.is_auto_increment, "联合主键不构成 rowid 别名");
     }
 
     #[test]
@@ -5053,6 +5155,7 @@ mod tests {
                 comment: None,
                 charset: None,
                 collation: None,
+                is_auto_increment: false,
             },
             ColumnInfo {
                 name: "tag_id".to_string(),
@@ -5063,6 +5166,7 @@ mod tests {
                 comment: None,
                 charset: None,
                 collation: None,
+                is_auto_increment: false,
             },
             ColumnInfo {
                 name: "ts".to_string(),
@@ -5073,6 +5177,7 @@ mod tests {
                 comment: None,
                 charset: None,
                 collation: None,
+                is_auto_increment: false,
             },
             ColumnInfo {
                 name: "value".to_string(),
@@ -5083,6 +5188,7 @@ mod tests {
                 comment: None,
                 charset: None,
                 collation: None,
+                is_auto_increment: false,
             },
         ];
 
@@ -5120,6 +5226,7 @@ mod tests {
                 comment: None,
                 charset: None,
                 collation: None,
+                is_auto_increment: false,
             },
             ColumnInfo {
                 name: "name".to_string(),
@@ -5130,6 +5237,7 @@ mod tests {
                 comment: None,
                 charset: None,
                 collation: None,
+                is_auto_increment: false,
             },
         ];
 
@@ -5283,6 +5391,21 @@ mod tests {
             window.draw(cx).clear(cx);
         });
         assert!(visual.debug_bounds(STRUCTURE_LOADING_SELECTOR).is_none());
+    }
+
+    /// 结构加载失败的提示必须能在当前 locale 解析出内容。
+    ///
+    /// 这条文案是加载失败时唯一的用户可见反馈（空白网格、没有提示正是本次
+    /// 问题的现场），key 打错会让用户直接看到原始 key。
+    #[test]
+    fn load_structure_failed_message_is_translated() {
+        let message = t!("Table.load_structure_failed", error = "boom").to_string();
+
+        assert!(message.contains("boom"), "{message}");
+        assert!(
+            !message.contains("Table.load_structure_failed"),
+            "{message}"
+        );
     }
 
     /// 构造表设计器窗口，返回 (designer, 打开瞬间是否在加载态, visual)。
