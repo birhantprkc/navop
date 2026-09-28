@@ -517,6 +517,8 @@ fn column_infos_from_query_meta(query_meta: &[QueryColumnMeta]) -> Vec<ColumnInf
             comment: None,
             charset: None,
             collation: None,
+            // 结果集元数据不携带自增信息。
+            is_auto_increment: false,
         })
         .collect()
 }
@@ -5011,6 +5013,7 @@ mod tests {
                     comment: None,
                     charset: None,
                     collation: None,
+                    is_auto_increment: false,
                 },
                 ColumnInfo {
                     name: "bit_name".to_string(),
@@ -5021,6 +5024,7 @@ mod tests {
                     comment: None,
                     charset: None,
                     collation: None,
+                    is_auto_increment: false,
                 },
             ]);
 

@@ -909,6 +909,8 @@ impl DatabaseEventHandler {
         );
         let tab_id_clone = tab_id.clone();
         let conn_id_clone = connection_id.clone();
+        // 详情页签是编辑器页签的兄弟：先把这个容器句柄带进内层闭包。
+        let host_tab_container = tab_container.clone();
 
         tab_container.update(cx, |container, cx| {
             container.activate_or_add_tab_lazy(
@@ -926,6 +928,7 @@ impl DatabaseEventHandler {
                                 initial_database: database.clone(),
                                 initial_schema: schema.clone(),
                                 execution_history: execution_history.clone(),
+                                tab_container: host_tab_container.clone(),
                             },
                             window,
                             cx,
@@ -1403,6 +1406,7 @@ impl DatabaseEventHandler {
                         let tab_id_for_item = tab_id.clone();
                         let connection_id_for_item = connection_id.clone();
                         let tab_metadata = tab_metadata.clone();
+                        let host_tab_container = tab_container.clone();
                         tab_container.update(cx, |container, cx| {
                             container.activate_or_add_tab_lazy(
                                 tab_id.clone(),
@@ -1421,6 +1425,7 @@ impl DatabaseEventHandler {
                                                 initial_database: Some(database.clone()),
                                                 initial_schema: schema.clone(),
                                                 execution_history: execution_history.clone(),
+                                                tab_container: host_tab_container.clone(),
                                             },
                                             window,
                                             cx,
@@ -1496,6 +1501,7 @@ impl DatabaseEventHandler {
                         let tab_id_for_item = tab_id.clone();
                         let connection_id_for_item = connection_id.clone();
                         let tab_metadata = tab_metadata.clone();
+                        let host_tab_container = tab_container.clone();
                         tab_container.update(cx, |container, cx| {
                             container.activate_or_add_tab_lazy(
                                 tab_id.clone(),
@@ -1514,6 +1520,7 @@ impl DatabaseEventHandler {
                                                 initial_database: Some(database.clone()),
                                                 initial_schema: schema.clone(),
                                                 execution_history: execution_history.clone(),
+                                                tab_container: host_tab_container.clone(),
                                             },
                                             window,
                                             cx,
@@ -4097,6 +4104,7 @@ impl DatabaseEventHandler {
             let tab_id_clone = tab_id.clone();
             let conn_id_clone = connection_id.clone();
             let tab_metadata_clone = tab_metadata.clone();
+            let host_tab_container = tab_container.clone();
 
             tab_container.update(cx, |container, cx| {
                 container.activate_or_add_tab_lazy(
@@ -4114,6 +4122,7 @@ impl DatabaseEventHandler {
                                     initial_database: database.clone(),
                                     initial_schema: schema.clone(),
                                     execution_history: execution_history.clone(),
+                                    tab_container: host_tab_container.clone(),
                                 },
                                 window,
                                 cx,

@@ -47,6 +47,7 @@ mod tests {
     /// 状态留在 `gpui-base`），其余是同一批文件里本来就来自组件库的控件。
     const MIGRATED_PAGES: &[(&str, &[&str])] = &[
         ("mqtt/ui/messages.js", &["Input", "Select", "Button"]),
+        ("mqtt/ui/topics.js", &["Input", "Button"]),
         ("mqtt/ui/publish.js", &["Input", "Textarea", "Switch"]),
         ("mqtt/ui/subscriptions.js", &["Input", "Select"]),
         ("rocketmq/ui/overview.js", &["Tag", "Button"]),
@@ -87,7 +88,12 @@ mod tests {
         root.to_path_buf()
     }
 
-    /// 替代 `navop.workbench` / `navop.dev` / `navop.log`。
+    /// 替代 `navop.workbench` / `navop.context` / `navop.dev` / `navop.log`。
+    ///
+    /// `navop.context` 必须在册:嵌入式工作台页面按 `ensure_embeddable` 的契约
+    /// **必须**声明 `context` + `workbench` 两个模块,页面用 `context.current()`
+    /// 读连接元数据(持久化状态、自动订阅过滤器)是正当用法,少注册这个模块
+    /// 会让守卫测试把能跑的页面判成加载失败。
     ///
     /// 返回值按各页面已经能处理的形状给：`dispatch` 为 `Null`（页面都写成
     /// `result?.x || []`），但 `navop.dev` 的 `list` / `logs` **必须是空数组** ——
@@ -99,6 +105,9 @@ mod tests {
         let workbench = HostModule::new("navop.workbench")
             .function("current", null)
             .function("dispatch", null);
+        // `current` 返回 `Null`:页面全部写成 `context.current()?.connection?...`,
+        // 缺上下文时自己兜底。
+        let context = HostModule::new("navop.context").function("current", null);
         let dev = HostModule::new("navop.dev")
             .function("list", empty)
             .function("logs", empty)
@@ -117,6 +126,8 @@ mod tests {
             Policy::new()
                 .with_host_module(workbench)
                 .expect("`navop.workbench` is not a reserved specifier")
+                .with_host_module(context)
+                .expect("`navop.context` is not a reserved specifier")
                 .with_host_module(dev)
                 .expect("`navop.dev` is not a reserved specifier")
                 .with_host_module(log)

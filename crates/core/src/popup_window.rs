@@ -5,7 +5,8 @@ use gpui::{
     prelude::FluentBuilder, px, size,
 };
 use gpui_component::{
-    ActiveTheme, Root, TITLE_BAR_HEIGHT, TitleBar, WindowExt, notification::Notification, v_flex,
+    ActiveTheme, Root, TITLE_BAR_HEIGHT, TitleBar, WindowExt, notification::Notification,
+    render_dialog_layer, render_notification_layer, render_sheet_layer, v_flex,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -32,9 +33,23 @@ fn main_window_handle() -> Option<AnyWindowHandle> {
 
 /// 「关闭后复用」的弹窗注册表：复用键 → 那个窗口。
 ///
-/// 只有通过 [`open_reusable_popup_window`] 打开的弹窗才会登记；**没登记的弹窗行为完全
-/// 不变**（仍是一次性窗口，关闭即销毁）。
+/// 只有通过 [`open_reusable_popup_window`] 打开的弹窗才会登记。没有复用键的一次性弹窗
+/// 登记在 [`PARKED_POPUPS`] 里，两者的关闭动作一致：**隐藏原生窗口，不销毁**。
 static REUSABLE_POPUPS: OnceLock<Mutex<HashMap<&'static str, ReusablePopup>>> = OnceLock::new();
+
+/// 一次性弹窗的登记表：窗口 id → 它的内容实体。
+///
+/// 一次性弹窗没有复用键，但**同样要「关闭即隐藏」**（否则 AppKit 会在自己的关闭流程里
+/// 销毁窗口，红点那条路还是会闪退，见 navop#308 / navop#314）。要隐藏它就得在关闭时按窗口
+/// 找到内容实体、把业务 view 卸掉，所以也得登记。
+///
+/// 代价说清楚：这类窗口隐藏后**没人会重新显示它**，下一次打开同一个对话框是**新建**一个
+/// 窗口。也就是说停放的窗口数会随打开次数增长、直到应用退出。它换来的是「绝不销毁原生
+/// 窗口」，而每个停放的窗口只留一个空壳（业务 view 在关闭时已经卸载）。要把数量真正压下去，
+/// 得把热点弹窗改成 [`open_reusable_popup_window`]，见
+/// `docs/macos-memory-investigation.md` §10.7。
+static PARKED_POPUPS: OnceLock<Mutex<HashMap<WindowId, WeakEntity<PopupWindowContent>>>> =
+    OnceLock::new();
 
 /// 注册表里的一项。
 ///
@@ -48,6 +63,10 @@ struct ReusablePopup {
 
 fn reusable_popups() -> &'static Mutex<HashMap<&'static str, ReusablePopup>> {
     REUSABLE_POPUPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn parked_popups() -> &'static Mutex<HashMap<WindowId, WeakEntity<PopupWindowContent>>> {
+    PARKED_POPUPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn record_reusable_popup(
@@ -82,10 +101,33 @@ fn forget_reusable_popup(key: &'static str) {
     }
 }
 
+/// 登记一个没有复用键的一次性弹窗（关闭时同样只隐藏、不销毁）。
+fn record_parked_popup(window_id: WindowId, content: WeakEntity<PopupWindowContent>) {
+    if let Ok(mut slots) = parked_popups().lock() {
+        let is_new_window = slots.insert(window_id, content).is_none();
+        drop(slots);
+        if is_new_window {
+            crate::popup_lifecycle::record_window_registered();
+            crate::popup_lifecycle::log_lifecycle("popup_window_registered");
+        }
+    }
+}
+
+fn forget_parked_popup(window_id: WindowId) {
+    if let Ok(mut slots) = parked_popups().lock() {
+        let removed = slots.remove(&window_id).is_some();
+        drop(slots);
+        if removed {
+            crate::popup_lifecycle::record_window_unregistered();
+            crate::popup_lifecycle::log_lifecycle("popup_window_unregistered");
+        }
+    }
+}
+
 /// 原生窗口被销毁时清掉它的登记（非 macOS、隐藏失败回落、应用退出）。
 ///
 /// 不清理的话条目会变成永不失效的脏数据，`live_windows` 只增不减。
-pub(crate) fn forget_reusable_popup_by_window(window_id: WindowId) {
+pub(crate) fn forget_popup_by_window(window_id: WindowId) {
     let key = reusable_popups().lock().ok().and_then(|slots| {
         slots
             .iter()
@@ -96,38 +138,47 @@ pub(crate) fn forget_reusable_popup_by_window(window_id: WindowId) {
     if let Some(key) = key {
         forget_reusable_popup(key);
     }
+    forget_parked_popup(window_id);
 }
 
-/// 这个窗口的内容实体；不是登记过的复用弹窗时返回 `None`。
-pub(crate) fn reusable_popup_content(
-    window_id: WindowId,
-) -> Option<WeakEntity<PopupWindowContent>> {
-    reusable_popups().lock().ok().and_then(|slots| {
+/// 这个窗口的内容实体；不是弹窗（或刚被销毁）时返回 `None`。
+pub(crate) fn popup_content(window_id: WindowId) -> Option<WeakEntity<PopupWindowContent>> {
+    let reusable = reusable_popups().lock().ok().and_then(|slots| {
         slots
             .values()
             .find(|entry| entry.handle.window_id() == window_id)
             .map(|entry| entry.content.clone())
-    })
+    });
+    if reusable.is_some() {
+        return reusable;
+    }
+
+    parked_popups().lock().ok()?.get(&window_id).cloned()
 }
 
-/// 这个窗口是不是登记过的「关闭后复用」弹窗。
+/// 这个窗口是不是弹窗（复用登记的，或一次性停放的）。
 ///
-/// [`crate::window_close::close_window_for_reuse`] 用它做兜底：**没登记的窗口照旧销毁**。
-/// 否则「隐藏了一个永远不会被重新显示、也没人会去复用它的窗口」就只是白白泄漏 ——
-/// 一个视图层的关闭按钮改错了，不该变成内存泄漏。
-pub(crate) fn is_reusable_popup(window_id: WindowId) -> bool {
-    reusable_popup_content(window_id).is_some()
+/// [`crate::window_close::close_window_for_reuse`] 用它区分两类窗口：
+///
+/// - **弹窗**：关闭 = 隐藏原生窗口（留着复用，或就此停放），**绝不销毁**；
+/// - **其他窗口**（设置窗口、编辑器窗口……）：照旧销毁 —— 它们不在这条复用链上，也不存在
+///   「AppKit 在自己的关闭流程里销毁窗口」那个崩溃点。
+///
+/// 这条兜底让视图层可以放心用这个函数替换 `window.remove_window()`：写错了也只是回到原
+/// 行为，而不是把某个窗口莫名其妙地藏起来。
+pub(crate) fn is_popup_window(window_id: WindowId) -> bool {
+    popup_content(window_id).is_some()
 }
 
-/// 结束这个复用弹窗的**业务会话**：卸载业务 view，清掉焦点与通知。
+/// 结束这个弹窗的**业务会话**：卸载业务 view，清掉焦点与通知。
 ///
-/// 原生窗口不受影响（它已经被隐藏，等着复用）。「复用的是窗口，不是上一轮的业务状态」——
-/// 下一次打开会用新的 factory 重建 view，用的也是本次调用传入的入参。
+/// 原生窗口不受影响（它已经被隐藏，等着复用或就此停放）。「复用的是窗口，不是上一轮的
+/// 业务状态」—— 复用窗口下一次打开会用新的 factory 重建 view，用的也是本次调用传入的入参。
 ///
 /// 清理**同步**发生在关闭动作内部，不交给 `defer`：延后清理会有「刚重新打开的新会话
 /// 被上一轮的清理任务删掉」的时序问题，同步卸载则根本不存在这个窗口期。
-pub(crate) fn end_reusable_popup_session(window: &mut Window, cx: &mut App) {
-    let Some(content) = reusable_popup_content(window.window_handle().window_id()) else {
+pub(crate) fn end_popup_session(window: &mut Window, cx: &mut App) {
+    let Some(content) = popup_content(window.window_handle().window_id()) else {
         return;
     };
 
@@ -147,22 +198,30 @@ pub(crate) fn end_reusable_popup_session(window: &mut Window, cx: &mut App) {
     crate::popup_lifecycle::log_lifecycle("popup_session_ended");
 }
 
-/// 该复用键的弹窗只是被隐藏（还活着）时：用 `factory` 重建它里面的 view，然后重新显示，
-/// 返回 `true`。
-///
-/// 用 `factory`（**本次调用**传进来的那个）而不是上次的，是为了保证内容跟着参数走：
-/// factory 决定 view 的全部入参，重建就等于「按这次的要求重新做一遍内容」。
-///
-/// 探活失败的条目会顺手清掉 —— 窗口可能已经被真正销毁（隐藏失败回落、被系统关掉、
-/// 或退出流程回收），此时返回 `false` 让调用方走新建路径。
-/// 给一个「关闭后复用」的弹窗接上所有关闭入口，让它们统一走「隐藏」。
+/// 给弹窗接上所有关闭入口，让它们统一走 [`crate::window_close::close_window_for_reuse`]。
 ///
 /// 光改视图内的取消/保存按钮是不够的：用户更常点的是**原生标题栏的红点**，那条路径由
 /// AppKit 自己发起（`windowShouldClose:`），不经过应用代码；还有 Cmd-W 一类走
-/// [`crate::window_close::request_close_window`] 的入口。漏掉任何一个，窗口还是会被销毁，
-/// 复用键永远命中不到 —— 也就白改了。
-fn install_reusable_popup_close_routes(window: &mut Window, cx: &mut App) {
-    // ① 原生关闭（macOS 红点 / 平台层 close）。返回 false 表示「别关」，窗口已经被隐藏。
+/// [`crate::window_close::request_close_window`] 的入口。
+///
+/// 漏掉红点不只是「白改」，而是会崩：那条路上窗口是由 AppKit 在**它自己的关闭流程里**
+/// 销毁的，此刻窗口的响应者（字段编辑器等）可能已经被 AppKit 释放，而 Touch Bar 查找器的
+/// 观察却是延迟到下一个显示周期才注销的 —— `-[_NSTouchBarFinderObservation invalidate]`
+/// 于是对一个已经不在的对象调用 `removeObserver:forKeyPath:context:`，异常没人接住，
+/// AppKit 的 `-[NSApplication _crashOnException:]` 直接 abort（现场见 navop#308 / navop#314，
+/// 上游记为 zed#64819）。
+///
+/// 我们这一侧发起的关闭（保存 / 取消按钮、Cmd-W）曾经走 `remove_window()` + GPUI 的延迟
+/// 回收，现场反馈「确定」那条路已经不崩了、只有红点还在崩 —— 差别正是**谁发起的销毁**。
+/// 现在两条路统一：先取消 AppKit 的关闭，再交给 `close_window_for_reuse`，而它**只隐藏、
+/// 不销毁**（见 [`crate::window_close::close_window_for_reuse`]）。于是「销毁原生窗口」这件事
+/// 在应用运行期间彻底消失，AppKit 的延迟注销也就永远踩不到已释放的对象。
+///
+/// **两类弹窗都要装**：一次性弹窗（没登记复用键）同样不能让 AppKit 自己销毁窗口，
+/// 否则「保存连接」这种最常见的一步还是闪退。它们没有复用键，关闭后只是停放在那里。
+fn install_popup_close_routes(window: &mut Window, cx: &mut App) {
+    // ① 原生关闭（macOS 红点 / 平台层 close）。返回 false 表示「别关」：AppKit 不参与销毁，
+    //    窗口交给 `close_window_for_reuse` 隐藏。
     window.on_window_should_close(cx, |window, cx| {
         let _ = crate::window_close::close_window_for_reuse(window, cx);
         false
@@ -183,6 +242,14 @@ fn install_reusable_popup_close_routes(window: &mut Window, cx: &mut App) {
     );
 }
 
+/// 该复用键的弹窗只是被隐藏（还活着）时：用 `factory` 重建它里面的 view，然后重新显示，
+/// 返回 `true`。
+///
+/// 用 `factory`（**本次调用**传进来的那个）而不是上次的，是为了保证内容跟着参数走：
+/// factory 决定 view 的全部入参，重建就等于「按这次的要求重新做一遍内容」。
+///
+/// 探活失败的条目会顺手清掉 —— 窗口可能已经被真正销毁（隐藏失败回落、被系统关掉、
+/// 或退出流程回收），此时返回 `false` 让调用方走新建路径。
 fn reshow_reusable_popup(
     key: &'static str,
     options: &PopupWindowOptions,
@@ -330,6 +397,12 @@ impl PopupWindowOptions {
 /// 刷新「窗口被拖到另一屏但未触发 resize」时 GPUI 未刷新的缓存 `display_id`，
 /// 从而保证弹窗落在真实所在屏幕。
 ///
+/// # 关闭行为
+///
+/// 这个窗口关闭时**只隐藏、不销毁**（见 [`crate::window_close::close_window_for_reuse`]）：
+/// 它是 macOS Touch Bar 机型闪退（navop#308 / navop#314）的修法。没有复用键，所以关闭后
+/// 不会有人重新显示它，下一次打开是新建一个窗口 —— 代价与后续收敛方向见 [`PARKED_POPUPS`]。
+///
 /// # 参数
 /// - `options`: 窗口配置选项
 /// - `create_view_fn`: 创建窗口内容的闭包
@@ -403,7 +476,7 @@ pub fn open_popup_window<F, E>(
 /// # 复用的是什么
 ///
 /// 复用**原生窗口**，不复用业务会话：窗口关闭时会卸载业务 view（见
-/// [`end_reusable_popup_session`]），下次打开用本次 factory 重建。所以调用方不需要写
+/// [`end_popup_session`]），下次打开用本次 factory 重建。所以调用方不需要写
 /// 任何复位逻辑，也不要把「关闭后还能读回上次的输入」当成契约。
 pub fn open_reusable_popup_window<F, E>(
     options: PopupWindowOptions,
@@ -423,7 +496,8 @@ pub fn open_reusable_popup_window<F, E>(
 
 /// [`open_popup_window`] 与 [`open_reusable_popup_window`] 的公共实现。
 ///
-/// `reuse_key` 为 `None` 时是标准的一次性弹窗；为 `Some` 时走「关闭后隐藏 + 复用」路径。
+/// `reuse_key` 为 `None` 时是一次性弹窗：关闭时同样只隐藏、不销毁，但没有复用键，
+/// 所以窗口只是**停放**在那里（详见 [`PARKED_POPUPS`]）。
 fn open_popup_window_inner(
     options: PopupWindowOptions,
     reuse_key: Option<&'static str>,
@@ -544,8 +618,12 @@ fn open_popup_window_inner(
             });
             if let Some(key) = reuse_key {
                 record_reusable_popup(key, window.window_handle(), content.downgrade());
-                install_reusable_popup_close_routes(window, cx);
+            } else {
+                record_parked_popup(window.window_handle().window_id(), content.downgrade());
             }
+            // 关闭路线对两类弹窗都要装：一次性弹窗也必须先取消 AppKit 的关闭、再走统一的
+            // 隐藏路线，否则「保存连接」这类最常见的关闭动作在红点路径上还是会闪退。
+            install_popup_close_routes(window, cx);
             cx.new(|cx| Root::new(content, window, cx))
         })?;
 
@@ -633,9 +711,9 @@ impl Drop for PopupWindowContent {
 
 impl Render for PopupWindowContent {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sheet_layer = Root::render_sheet_layer(window, cx);
-        let dialog_layer = Root::render_dialog_layer(window, cx);
-        let notification_layer = Root::render_notification_layer(window, cx);
+        let sheet_layer = render_sheet_layer(window, cx);
+        let dialog_layer = render_dialog_layer(window, cx);
+        let notification_layer = render_notification_layer(window, cx);
         let auto_hide_titlebar = self.hide_titlebar_when_fullscreen && window.is_fullscreen();
 
         v_flex()
@@ -705,7 +783,7 @@ fn render_popup_titlebar(title: String) -> TitleBar {
 ///
 /// 「关闭即隐藏」的修复有一个特点：**改坏了不会报错，只会悄悄失去作用** ——
 /// 窗口还是会销毁（于是 Touch Bar 机型还是会崩），或者更糟：藏进虚无再也没人打开（泄漏）。
-/// 所以把三条不变量钉在测试里。本机没有 Touch Bar，行为层面无法复现，这里是唯一能自动化的防线。
+/// 所以把下面几条不变量钉在测试里。本机没有 Touch Bar，行为层面无法复现，这里是唯一能自动化的防线。
 #[cfg(test)]
 mod reuse_contract_tests {
     const POPUP_SOURCE: &str = include_str!("popup_window.rs");
@@ -724,27 +802,33 @@ mod reuse_contract_tests {
         &rest[..end]
     }
 
-    /// 「隐藏」只对登记过复用键的窗口生效。
+    /// **弹窗只隐藏、不销毁**；销毁只剩「不是弹窗」和「隐藏失败」两条兜底。
     ///
-    /// 视图层的关闭按钮现在统一换成 `close_window_for_reuse`；万一某个窗口忘了（或不该）
-    /// 登记复用键，隐藏它就意味着「有一个窗口永远留在虚无里」。所以判断必须排在实际隐藏之前。
+    /// 0.3.118 的现场把不变量抬到了这一步：只要窗口是在**某条路线**上被销毁的，那条路线
+    /// 就会被 AppKit 的延迟注销踩到（#308 「确定」、#314 「保存」、以及红点）。所以成功
+    /// 隐藏的分支里绝不能出现销毁动作 —— 否则修了三条路、还会漏第四条。
     #[test]
-    fn only_registered_windows_are_hidden() {
+    fn popup_windows_are_hidden_and_never_destroyed() {
         let close = body(CLOSE_SOURCE, "pub fn close_window_for_reuse");
 
         let guard = close
-            .find("is_reusable_popup(")
-            .expect("close_window_for_reuse must ask whether the window is registered");
+            .find("is_popup_window(")
+            .expect("close_window_for_reuse must ask whether the window is a popup window");
         let hide = close
             .find("hide_for_reuse(")
-            .expect("close_window_for_reuse must hide registered windows");
+            .expect("close_window_for_reuse must hide popup windows");
         assert!(
             guard < hide,
-            "the registration check must come *before* hiding, otherwise unregistered windows leak"
+            "the popup check must come *before* hiding: non-popup windows (settings, editors) \
+             are still destroyed on purpose and must not be hidden by accident"
         );
-        assert!(
-            close.contains("window.remove_window();"),
-            "close_window_for_reuse must still destroy unregistered windows"
+
+        let destroys = close.matches("window.remove_window();").count();
+        assert_eq!(
+            destroys, 3,
+            "destroying is only allowed for a non-popup window, a refused hide (`Ok(false)`) \
+             and a failed hide (`Err`); a successful hide must never destroy the window, \
+             otherwise the Touch Bar finder can retract an observation of a dead object again"
         );
     }
 
@@ -784,9 +868,9 @@ mod reuse_contract_tests {
         let close = body(CLOSE_SOURCE, "pub fn close_window_for_reuse");
         let hide = close
             .find("hide_for_reuse(")
-            .expect("close_window_for_reuse must hide registered windows");
+            .expect("close_window_for_reuse must hide popup windows");
         let end = close
-            .find("end_reusable_popup_session(")
+            .find("end_popup_session(")
             .expect("closing must also end the business session, not just hide the window");
         assert!(
             hide < end,
@@ -806,7 +890,7 @@ mod reuse_contract_tests {
             "end_session must release the business view instead of keeping it alive"
         );
 
-        let release = body(POPUP_SOURCE, "fn end_reusable_popup_session");
+        let release = body(POPUP_SOURCE, "fn end_popup_session");
         assert!(
             release.contains("content.end_session"),
             "the close route must end the popup's business session"
@@ -823,14 +907,27 @@ mod reuse_contract_tests {
         );
     }
 
-    /// 复用窗口要把**所有**关闭入口都接上。
+    /// 去掉行注释和所有空白，用来做「A 紧跟在 B 之后」这类结构断言（不受缩进 / 换行影响）。
     ///
-    /// 只改视图里的取消/保存按钮是不够的：用户更常点的是原生标题栏的红点，那条路径由 AppKit
-    /// 的 `windowShouldClose:` 发起，压根不经过应用代码。漏掉它，窗口还是会被销毁 ——
-    /// 也就等于这次修复对真实用户无效。
+    /// 注释必须一起去掉：注释文字会被压进字符串里，让「上一个有效 token 是什么」判断失真。
+    fn squash_code(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .flat_map(str::chars)
+            .filter(|ch| !ch.is_whitespace())
+            .collect()
+    }
+
+    /// **每一类**弹窗都要接上原生关闭路线，而且这条路线必须在 `reuse_key` 分支**之外**。
+    ///
+    /// 只改视图里的取消/保存按钮是不够的：用户更常点的是原生标题栏的红点，那条路径由
+    /// AppKit 自己发起（`windowShouldClose:`），不经过应用代码，而且窗口是由 AppKit 在
+    /// **它自己的关闭流程里**销毁的 —— 那正是 #308 / #314 的崩溃点。一次性弹窗
+    /// （保存连接那类）没接住红点的话，最常见的关闭动作还是闪退。
     #[test]
-    fn reusable_windows_hide_on_every_close_route() {
-        let routes = body(POPUP_SOURCE, "fn install_reusable_popup_close_routes");
+    fn every_popup_intercepts_the_native_close_route() {
+        let routes = body(POPUP_SOURCE, "fn install_popup_close_routes");
         assert!(
             routes.contains("on_window_should_close"),
             "the native close route (macOS traffic light / windowShouldClose:) must be intercepted"
@@ -841,13 +938,39 @@ mod reuse_contract_tests {
         );
         assert!(
             routes.contains("close_window_for_reuse"),
-            "every intercepted route must end up hiding the window"
+            "every intercepted route must go through the single close funnel"
         );
 
-        let opener = body(POPUP_SOURCE, "fn open_popup_window_inner");
+        let opener = squash_code(body(POPUP_SOURCE, "fn open_popup_window_inner"));
+        let (before_install, _) = opener
+            .split_once("install_popup_close_routes(window,cx);")
+            .expect("the opener must install the close routes on every window it creates");
         assert!(
-            opener.contains("install_reusable_popup_close_routes"),
-            "the reusable opener must install those routes when it creates the window"
+            before_install.ends_with('}'),
+            "install_popup_close_routes must be a sibling of the `reuse_key` branch: inside it, \
+             one-shot popups (the save-connection dialog) would keep letting AppKit destroy the \
+             window and still crash"
+        );
+    }
+
+    /// 一次性弹窗也必须登记（停放到 `PARKED_POPUPS`）。
+    ///
+    /// 关闭时靠登记表按窗口找到内容实体、把业务 view 卸掉；没登记的话窗口是隐藏了，
+    /// 但上一次打开的数据还挂在那里。而且它必须在 `else` 分支里：一次性弹窗的 factory
+    /// 用 `RefCell` 兜成了只能调用一次（[`open_popup_window`]），接到复用路径上会在第二次
+    /// 调用时 panic。
+    #[test]
+    fn one_shot_popups_are_registered_as_parked() {
+        let opener = squash_code(body(POPUP_SOURCE, "fn open_popup_window_inner"));
+        assert!(
+            opener.contains("record_reusable_popup("),
+            "reuse-keyed popups must keep their registration: it is what makes re-showing work"
+        );
+        assert!(
+            opener.contains("}else{record_parked_popup("),
+            "one-shot popups must be parked in the else branch of the `reuse_key` check: \
+             without an entry the close route cannot find their content entity, and reusing a \
+             one-shot factory would panic on the second call"
         );
     }
 }

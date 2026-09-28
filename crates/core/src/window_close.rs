@@ -50,9 +50,9 @@ pub fn init(cx: &mut App) {
                 .state
                 .remove(window_id);
         }
-        // 复用弹窗的登记表同样按 window_id 清理：窗口真的被销毁（非 macOS、隐藏失败回落、
-        // 应用退出）而条目还留着，就会变成永远不会被复用的脏条目。
-        crate::popup_window::forget_reusable_popup_by_window(window_id);
+        // 弹窗（复用登记的或一次性停放的）登记表都按 window_id 清理：窗口真的被销毁
+        // （非 macOS、隐藏失败回落、应用退出）而条目还留着，就会变成永不失效的脏条目。
+        crate::popup_window::forget_popup_by_window(window_id);
     });
     cx.set_global(WindowCloseRegistry {
         state: WindowCloseState::default(),
@@ -144,14 +144,27 @@ pub fn hide_for_reuse(_window: &Window) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-/// 关闭一个原生窗口：macOS 上优先「隐藏后复用」，其他平台或隐藏失败时退回销毁。
+/// 关闭一个弹窗：macOS 上隐藏原生窗口（**不销毁**）并结束业务会话；其他平台或隐藏失败时
+/// 退回销毁。
 ///
 /// 返回 `true` 表示窗口只是被隐藏、**仍然存活**。
 ///
-/// ⚠️ 只有**登记过复用键**的窗口（用
-/// [`crate::popup_window::open_reusable_popup_window`] 打开的）才会真的被隐藏；其余窗口
-/// 一律照旧销毁 —— 隐藏一个没人会重新显示的窗口只是泄漏。这条兜底让视图层可以放心
-/// 用这个函数替换 `window.remove_window()`，写错了也只是回到原行为。
+/// # 弹窗一律不销毁
+///
+/// 凡是通过 [`crate::popup_window::open_popup_window`] / [`crate::popup_window::open_reusable_popup_window`]
+/// 打开的窗口，关闭时都只隐藏 —— 包括**没有复用键的一次性弹窗**。这不是保守，而是现场
+/// 逼出来的：只要窗口是在**某条路线**上被销毁的，那条路线就会被 AppKit 的 Touch Bar
+/// 观察者延迟注销踩到（#308 「确定」、#314 「保存」，以及 0.3.118 版里唯一还在崩的红点）。
+/// 把销毁从应用运行期间彻底拿掉，这类现场就没了。
+///
+/// 代价是真实的，说在明处：一次性弹窗隐藏后没人会重新显示它，下一次打开是**新建**窗口，
+/// 所以停放窗口数会随打开次数增长。留给后续的两条路：（1）把热点弹窗改成
+/// [`crate::popup_window::open_reusable_popup_window`]（复用同一个窗口，数量收敛到「弹窗
+/// 种类数」）；（2）给停放窗口数设上限，超过时按我们自己的路线延迟销毁最旧的一个 —— 那时
+/// 销毁已经不在 AppKit 的关闭流程里。
+///
+/// 不在这条链上的窗口（设置窗口、编辑器窗口……）照旧销毁：它们不经过弹窗登记表，也没有
+/// 上面那个崩溃点。
 ///
 /// # 「关闭」包含两件事，缺一不可
 ///
@@ -165,14 +178,16 @@ pub fn hide_for_reuse(_window: &Window) -> anyhow::Result<bool> {
 ///
 /// 参数里有 `cx` 就是因为第 2 步必须能更新内容实体；只有 `&mut Window` 的接口做不到。
 pub fn close_window_for_reuse(window: &mut Window, cx: &mut App) -> bool {
-    if !crate::popup_window::is_reusable_popup(window.window_handle().window_id()) {
+    // 不是弹窗：照旧销毁。它不在这条复用链上，也没有「AppKit 在关闭流程里销毁弹窗」
+    // 那个崩溃点；顺手也把视图层「改错了本该销毁的窗口」变成隐藏的风险挡住。
+    if !crate::popup_window::is_popup_window(window.window_handle().window_id()) {
         window.remove_window();
         return false;
     }
 
     match hide_for_reuse(window) {
         Ok(true) => {
-            crate::popup_window::end_reusable_popup_session(window, cx);
+            crate::popup_window::end_popup_session(window, cx);
             true
         }
         Ok(false) => {

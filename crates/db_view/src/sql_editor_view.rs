@@ -1,13 +1,14 @@
 use crate::sidebar::execution_history_panel::ExecutionHistoryPanel;
 use crate::sql_editor::{
-    ForeignSchema, RunCursorStatementSql, RunSelectedSql, SQL_GUTTER_CANCELLED, SQL_GUTTER_FAILED,
-    SQL_GUTTER_IDLE, SQL_GUTTER_RUNNING, SQL_GUTTER_SUCCEEDED, SqlColumnDetail, SqlEditor,
-    SqlObjectType, SqlSchema, SqlTableDetail, pending_foreign_qualifiers,
+    ForeignSchema, ForeignSchemaScope, RunCursorStatementSql, RunSelectedSql, SQL_GUTTER_CANCELLED,
+    SQL_GUTTER_FAILED, SQL_GUTTER_IDLE, SQL_GUTTER_RUNNING, SQL_GUTTER_SUCCEEDED, SqlColumnDetail,
+    SqlEditor, SqlObjectType, SqlSchema, SqlTableDetail, pending_foreign_qualifiers,
 };
 use crate::sql_result_tab::{
     ExecutionState, SessionSchemaInvalidation, SessionSqlRun, SqlResultTabContainer,
     emit_schema_changed_events,
 };
+use crate::table_ddl::TableDdlSources;
 use db::cache_manager::{GlobalNodeCache, SchemaInvalidationPlan};
 use db::plugin::SqlCompletionInfo;
 use db::sql_editor::execution::{
@@ -642,6 +643,10 @@ async fn fetch_foreign_schema_metadata(
 
     let mut foreign = ForeignSchema {
         name: qualifier.to_string(),
+        scope: ForeignSchemaScope {
+            database: database.to_string(),
+            schema: schema.clone(),
+        },
         tables: Vec::with_capacity(tables.len()),
         columns_by_table: HashMap::new(),
         table_details: HashMap::new(),
@@ -1344,6 +1349,9 @@ pub struct SqlEditorTabConfig {
     pub initial_database: Option<String>,
     pub initial_schema: Option<String>,
     pub execution_history: Entity<ExecutionHistoryPanel>,
+    /// 编辑器所住的页签容器（数据库页签内部的容器）：对象详情页签要开在这里，
+    /// 而不是主窗口的页签栏。
+    pub tab_container: Entity<TabContainer>,
 }
 
 /// A windowed statement scan plus the buffer rows it covers.
@@ -1545,6 +1553,17 @@ impl SqlEditorTab {
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| SqlEditor::new(window, cx));
+        // 详情页签是编辑器页签的兄弟，必须开在同一个容器里；建表 DDL 与表设计器
+        // 同一条驱动链路，所以还要带上连接与方言。
+        let ddl_sources = TableDdlSources::driven(
+            cx.global::<GlobalDbState>().clone(),
+            config.connection_id.clone(),
+            config.database_type.clone(),
+        );
+        editor.update(cx, |editor, _| {
+            editor.set_tab_container(config.tab_container.clone());
+            editor.set_table_ddl_sources(Some(ddl_sources));
+        });
         let focus_handle = cx.focus_handle();
         let global_state = cx.global::<GlobalDbState>().clone();
         let execution_history = config.execution_history.clone();

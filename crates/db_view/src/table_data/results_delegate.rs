@@ -3856,6 +3856,7 @@ mod tests {
             } else {
                 None
             },
+            is_auto_increment: false,
         }
     }
 
@@ -3869,6 +3870,7 @@ mod tests {
             comment: None,
             charset: None,
             collation: None,
+            is_auto_increment: false,
         }
     }
 
