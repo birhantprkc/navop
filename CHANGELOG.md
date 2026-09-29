@@ -8,11 +8,11 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 
 #### 更新内容
 
-- macOS（Intel Mac / Touch Bar）：关闭窗口闪退的问题这次收口到「所有会开窗口的入口」。上一版把弹窗的关闭路径收进统一漏斗之后仍会崩，因为表单、远程桌面、表导出、编辑器窗口里还各有自己销毁原生窗口的入口——从那些入口关闭（例如表单里的「保存」）照样走到 AppKit 的销毁流程。现在这些窗口的关闭一律经过同一条漏斗：不销毁原生窗口，只隐藏并结束业务会话，下次打开同一目标直接复用那个原生窗口。同时开多个窗口（同时编辑两个连接、同时连两台远程桌面、同一连接库的不同表导出）互不干扰。
+- macOS（Touch Bar 机型）：关闭窗口闪退的问题这次收口到「所有会开窗口的入口」。上一版把弹窗的关闭路径收进统一漏斗之后仍会崩，因为表单、远程桌面、表导出、编辑器窗口里还各有自己销毁原生窗口的入口——从那些入口关闭（例如表单里的「保存」）照样走到 AppKit 的销毁流程。现在这些窗口的关闭一律经过同一条漏斗：不销毁原生窗口，只隐藏并结束业务会话，下次打开同一目标直接复用那个原生窗口。同时开多个窗口（同时编辑两个连接、同时连两台远程桌面、同一连接库的不同表导出）互不干扰。
 
 #### 修复与优化
 
-- 「关闭即隐藏」改为只对 Intel Mac 生效：Touch Bar 只存在于 x86_64 机型，而隐藏的原生窗口会一直占着 NSWindow 与渲染层直到进程退出。ARM Mac、Windows、Linux 恢复为原来的「关闭即销毁」，不再为这个修复承担内存代价。
+- 「关闭即隐藏」当前只在 Intel 版 macOS 包（x86_64）里默认打开：已复现的闪退现场都在 Intel 机型上，而隐藏的原生窗口会一直占着 NSWindow 与渲染层直到进程退出。ARM Mac、Windows、Linux 保持原来的「关闭即销毁」，不再为这个修复承担内存代价；Apple Silicon 的 13 英寸 MacBook Pro（M1 2020 / M2 2022）同样带 Touch Bar，那一侧需要同样保护时给对应构建打开同一个开关即可。
 - 内部依赖更新（gpui 分支 fork-0.3.121 / fork-0.3.122）：Touch Bar 重复注销异常的捕获挪到 Objective-C 侧编译，release 构建的 panic=abort 下才真正生效（此前 Rust 侧的捕获在 release 里形同虚设）。
 
 国内下载：如果 GitHub 下载较慢，可从 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases/tag/v0.19.4) 下载桌面端安装包
@@ -21,11 +21,11 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 
 #### What's New
 
-- macOS (Intel Mac / Touch Bar): closing a window no longer crashes, now covering every entry point that opens a window. Closing the dialog path in the previous release was not enough: forms, remote desktop, table export and the editor window each destroyed their own native window, so closing from any of those (the "Save" button in a form, for example) still entered AppKit's destruction flow. All of them now go through the same funnel — the native window is hidden rather than destroyed, the session ends, and opening the same target again reuses that window. Multiple windows open at the same time (two connections being edited, two remote desktops, exports of different tables in one connection) no longer interfere with each other.
+- macOS (Touch Bar models): closing a window no longer crashes, now covering every entry point that opens a window. Closing the dialog path in the previous release was not enough: forms, remote desktop, table export and the editor window each destroyed their own native window, so closing from any of those (the "Save" button in a form, for example) still entered AppKit's destruction flow. All of them now go through the same funnel — the native window is hidden rather than destroyed, the session ends, and opening the same target again reuses that window. Multiple windows open at the same time (two connections being edited, two remote desktops, exports of different tables in one connection) no longer interfere with each other.
 
 #### Fixes and Improvements
 
-- "Hide on close" now applies to Intel Macs only: the Touch Bar exists on x86_64 machines alone, while a hidden native window keeps its NSWindow and rendering layer alive until the process exits. ARM Macs, Windows and Linux keep destroying on close, so they no longer pay a memory cost for this fix.
+- "Hide on close" is currently on by default only for the Intel macOS package (x86_64): every reproduced crash came from an Intel model, and a hidden native window keeps its NSWindow and rendering layer alive until the process exits. ARM Macs, Windows and Linux keep destroying on close, so they no longer pay a memory cost for this fix; the 13-inch MacBook Pro with M1 (2020) or M2 (2022) also has a Touch Bar, so that side can switch the same feature on for its build whenever the protection is needed.
 - Internal dependency update (gpui fork 0.3.121 / 0.3.122): the Touch Bar duplicate-unregistration exception is now caught in code compiled as Objective-C, which is what makes it effective in release builds with panic=abort (the Rust-side catch never took effect there).
 
 **Full Changelog**: https://github.com/feigeCode/navop/compare/v0.19.3...v0.19.4

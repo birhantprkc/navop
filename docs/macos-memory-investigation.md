@@ -871,10 +871,10 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
   让原生窗口重新被释放（停放窗口的内存代价随之消失）。
 
 
-### 10.12 「不销毁窗口」收进一个开关，只给 Intel Mac 打开（2026-09-29）
+### 10.12 「不销毁窗口」收进一个开关，当前只给 Intel 版 macOS 包打开（2026-09-29）
 
 §10.7 的「不销毁任何弹窗」当时是无条件生效的：所有平台、所有构建都在付「隐藏的原生窗口
-一直占着 NSWindow / CAMetalLayer」这个代价，而 Touch Bar 只存在于 x86_64 机型。这一版把它
+一直占着 NSWindow / CAMetalLayer」这个代价，而当时只有 Intel 机型报过闪退。这一版把它
 收敛成一个 cargo feature：
 
 - **开关**：`crates/core/Cargo.toml` 的 `macos-touchbar-window-hide`（`default = []`），
@@ -889,8 +889,13 @@ arm 都一样）没有 Touch Bar。因此 CI 能钉住的是「修复所依赖�
   加这套机制之前的形态：关闭即销毁。打包契约测试 `script/test-release-packaging.mjs` 钉住三点 ——
   feature 只出现一次、只挂在 `x86_64-apple-darwin` 判定下、两条编译命令（`cargo zigbuild` /
   `cargo build`）都通过同一个变量消费它。
-- **为什么不开给 ARM Mac**：ARM 机型没有 Touch Bar，崩溃链不存在；而代价是真实的 —— 隐藏的
-  窗口不会释放，`CAMetalLayer` 与它的缓冲区会留在进程里。没有收益只有代价的默认值不该改。
+- **为什么当前不开给 Apple Silicon**（2026-09-30 修正）：**不是**「ARM 没有 Touch Bar」——
+  13 英寸 MacBook Pro 的 M1（2020）与 M2（2022）都是 Apple Silicon + Touch Bar，「Touch Bar
+  只存在于 x86_64 机型」这个说法是错的。当前只给 Intel 版 macOS 包打开的**唯一**理由是
+  「已复现的闪退现场都在 Intel 机器上」（#262 的 `MacBookPro16,2`）。隐藏窗口的代价是真实的
+  （窗口不释放，`CAMetalLayer` 与它的缓冲区留在进程里），所以在没有现场证据的机型上先不付这笔
+  代价。判据里没有架构条件，Apple Silicon 侧要复现或验证时给对应构建打开同一个 feature 即可，
+  不用改代码。
 - **顺带补齐「所有打开窗口的地方」**：开关生效时，弹窗一律走复用（`open_reusable_popup_window`
   + 按目标取键，例如 `connection-form:ssh:42`、`table-export:{conn}:{db}.{schema}.{table}`），
   视图内部原先自己 `window.remove_window()` 的 15 个表单/工具栏窗口改成走
