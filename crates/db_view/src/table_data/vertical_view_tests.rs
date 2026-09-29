@@ -329,6 +329,43 @@ fn grid_only_affordances_are_hidden_in_the_vertical_view() {
 }
 
 #[test]
+fn commit_changes_button_keeps_a_loading_state_while_saving() {
+    let grid = data_grid_source();
+    let toolbar = slice_between(
+        grid,
+        "pub fn render_toolbar(",
+        "\n    pub fn render_table_area(",
+    );
+
+    assert!(toolbar.contains("let saving = self.table.read(cx).delegate().is_saving();"));
+    let commit = slice_between(
+        toolbar,
+        "Button::new(\"commit-changes\")",
+        ".on_click(cx.listener(Self::handle_commit_changes))",
+    );
+    assert!(
+        commit.contains(".loading(saving)"),
+        "提交更改要走数据库，按钮必须能显示 loading"
+    );
+
+    // 保存入口拿到变更后立起标志，三条退出路径（分页索引失败、生成 SQL 失败、
+    // 执行结束）都要落回 false，否则按钮会一直转。
+    let save = slice_between(
+        grid,
+        "fn handle_save_changes(",
+        "\n    pub fn show_sql_preview(",
+    );
+    assert!(save.contains("self.set_saving(true, cx);"));
+    assert_eq!(3, count_matches(save, "this.set_saving(false, cx);"));
+
+    // 状态写在 delegate 上：DataGrid 已 observe 表格实体，只有那里才能
+    // 在异步回调里触发工具栏重画。
+    let setter = slice_between(grid, "fn set_saving(", "\n    fn handle_save_changes(");
+    assert!(setter.contains("state.delegate_mut().set_saving(saving);"));
+    assert!(setter.contains("cx.notify();"));
+}
+
+#[test]
 fn the_display_mode_is_persisted_beyond_the_data_grid_instance() {
     let grid = data_grid_source();
     let body = slice_between(grid, "fn switch_view_mode(", "\n    /// 「显示方式」入口");

@@ -175,6 +175,8 @@ pub struct EditorTableDelegate {
     editable: bool,
     /// Whether the table is currently loading data
     loading: bool,
+    /// 是否正在把待提交的变更写回数据库（工具栏「提交更改」按钮据此显示 loading）。
+    saving: bool,
     /// Database type for handling database-specific behaviors
     database_type: DatabaseType,
     /// Table name for SQL generation
@@ -281,6 +283,7 @@ impl Clone for EditorTableDelegate {
             hidden_columns: self.hidden_columns.clone(),
             editable: self.editable,
             loading: self.loading,
+            saving: self.saving,
             database_type: self.database_type.clone(),
             table_name: self.table_name.clone(),
             primary_key_indices: self.primary_key_indices.clone(),
@@ -325,6 +328,7 @@ impl EditorTableDelegate {
             hidden_columns: HashSet::new(),
             editable,
             loading: false,
+            saving: false,
             database_type,
             table_name: SharedString::default(),
             primary_key_indices: Vec::new(),
@@ -720,6 +724,16 @@ impl EditorTableDelegate {
     /// Get loading state
     pub fn is_loading(&self) -> bool {
         self.loading
+    }
+
+    /// 标记「保存变更」的进行状态。
+    pub fn set_saving(&mut self, saving: bool) {
+        self.saving = saving;
+    }
+
+    /// 是否正在保存变更。
+    pub fn is_saving(&self) -> bool {
+        self.saving
     }
 
     /// Check if this delegate has rowids
@@ -3620,6 +3634,7 @@ mod tests {
             hidden_columns: HashSet::new(),
             editable: true,
             loading: false,
+            saving: false,
             database_type: DatabaseType::MySQL,
             table_name: SharedString::default(),
             primary_key_indices: Vec::new(),
@@ -3644,6 +3659,19 @@ mod tests {
         delegate
             .original_binary_cells
             .insert((row_ix, col_ix), bytes);
+    }
+
+    #[test]
+    fn saving_flag_round_trips_and_survives_the_save_path_clone() {
+        let mut delegate = test_delegate(vec![vec![Some("1".to_string()), Some("a".to_string())]]);
+
+        assert!(!delegate.is_saving());
+        delegate.set_saving(true);
+        assert!(delegate.is_saving());
+        // 提交路径持有的是 clone，状态必须跟着克隆走。
+        assert!(delegate.clone().is_saving());
+        delegate.set_saving(false);
+        assert!(!delegate.is_saving());
     }
 
     #[test]

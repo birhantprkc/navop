@@ -1261,6 +1261,8 @@ struct QueryToolbarButtonSpec {
     color: Hsla,
     tooltip: SharedString,
     disabled: bool,
+    /// 按钮自身的异步动作进行中时显示 loading（自动换成 spinner）。
+    loading: bool,
 }
 
 /// 工具栏按钮组之间的竖向分隔线。
@@ -1281,6 +1283,15 @@ fn query_toolbar_action(is_executing: bool, has_selection: bool) -> QueryToolbar
     } else {
         QueryToolbarAction::Run
     }
+}
+
+/// 提交 / 回滚按钮的 loading 只属于正在收尾的那个动作：另一个按钮保持
+/// 普通图标（但已被禁用），避免两个按钮同时转圈分不清在提交还是回滚。
+fn transaction_action_loading(
+    finishing: Option<ManualTransactionAction>,
+    action: ManualTransactionAction,
+) -> bool {
+    finishing == Some(action)
 }
 
 fn is_current_query_context_generation(expected: u64, current: u64) -> bool {
@@ -1483,7 +1494,9 @@ pub struct SqlEditorTab {
     /// install or clear a session owned by a newer operation.
     manual_transaction_generation: Arc<AtomicU64>,
     manual_transaction_starting: bool,
-    manual_transaction_finishing: bool,
+    /// 正在收尾的手动事务动作（提交 / 回滚）。`None` 表示没有收尾中的操作，
+    /// 有值时对应按钮显示 loading。
+    manual_transaction_finishing: Option<ManualTransactionAction>,
     /// 自动保存序列号，用于防抖
     auto_save_seq: Arc<AtomicU64>,
     /// 是否有未保存的修改
@@ -1663,7 +1676,7 @@ impl SqlEditorTab {
             manual_transaction: None,
             manual_transaction_generation,
             manual_transaction_starting: false,
-            manual_transaction_finishing: false,
+            manual_transaction_finishing: None,
             auto_save_seq: auto_save_seq.clone(),
             is_dirty: is_dirty.clone(),
             context_generation,
@@ -1872,7 +1885,7 @@ impl SqlEditorTab {
     fn has_manual_transaction_lifecycle(&self) -> bool {
         self.manual_transaction.is_some()
             || self.manual_transaction_starting
-            || self.manual_transaction_finishing
+            || self.manual_transaction_finishing.is_some()
     }
 
     fn refresh_statement_snapshot(&mut self, cx: &mut Context<Self>) {
@@ -3465,7 +3478,7 @@ impl SqlEditorTab {
         let action = manual_sql_execution_action(
             &self.database_type,
             installed_session_matches_scope,
-            self.manual_transaction_starting || self.manual_transaction_finishing,
+            self.manual_transaction_starting || self.manual_transaction_finishing.is_some(),
         );
 
         match action {
@@ -3554,7 +3567,7 @@ impl SqlEditorTab {
         let context_generation = self.context_generation.load(Ordering::SeqCst);
         let context_generation_guard = self.context_generation.clone();
         self.manual_transaction_starting = true;
-        self.manual_transaction_finishing = false;
+        self.manual_transaction_finishing = None;
         cx.notify();
 
         let global_state = cx.global::<GlobalDbState>().clone();
@@ -3772,7 +3785,7 @@ impl SqlEditorTab {
             window.push_notification(t!("Query.transaction_control_unavailable").to_string(), cx);
             return;
         };
-        if self.manual_transaction_finishing {
+        if self.manual_transaction_finishing.is_some() {
             window.push_notification(t!("Query.running").to_string(), cx);
             return;
         }
@@ -3783,7 +3796,7 @@ impl SqlEditorTab {
             + 1;
         let transaction_generation = self.manual_transaction_generation.clone();
         let session_id = session.session_id().to_string();
-        self.manual_transaction_finishing = true;
+        self.manual_transaction_finishing = Some(action);
         cx.notify();
 
         let global_state = cx.global::<GlobalDbState>().clone();
@@ -3830,9 +3843,9 @@ impl SqlEditorTab {
                         if session_dead {
                             // 事务已被断连终止：整体满退，放行关闭。
                             this.manual_transaction = None;
-                            this.manual_transaction_finishing = false;
+                            this.manual_transaction_finishing = None;
                         } else {
-                            this.manual_transaction_finishing = false;
+                            this.manual_transaction_finishing = None;
                         }
                         cx.notify();
                         true
@@ -3903,7 +3916,7 @@ impl SqlEditorTab {
                         return false;
                     }
                     this.manual_transaction = None;
-                    this.manual_transaction_finishing = false;
+                    this.manual_transaction_finishing = None;
                     cx.notify();
                     true
                 })
@@ -3955,7 +3968,7 @@ impl SqlEditorTab {
                 self.manual_transaction_generation
                     .fetch_add(1, Ordering::SeqCst);
                 self.manual_transaction_starting = false;
-                self.manual_transaction_finishing = false;
+                self.manual_transaction_finishing = None;
                 self.finalize_execution_marker(SqlGutterMarkerState::Cancelled, cx);
                 cx.notify();
             }
@@ -3963,7 +3976,7 @@ impl SqlEditorTab {
                 self.manual_transaction_generation
                     .fetch_add(1, Ordering::SeqCst);
                 self.manual_transaction_starting = false;
-                self.manual_transaction_finishing = false;
+                self.manual_transaction_finishing = None;
                 let Some(session) = self.manual_transaction.take() else {
                     return;
                 };
@@ -4573,7 +4586,8 @@ impl SqlEditorTab {
         let is_manual_mode = self.transaction_mode == SqlTransactionMode::Manual;
         let has_manual_transaction = self.manual_transaction.is_some();
         let is_manual_transaction_starting = self.manual_transaction_starting;
-        let is_manual_transaction_finishing = self.manual_transaction_finishing;
+        let is_manual_transaction_finishing = self.manual_transaction_finishing.is_some();
+        let finishing_action = self.manual_transaction_finishing;
         let has_manual_transaction_lifecycle = self.has_manual_transaction_lifecycle();
 
         let is_query_executing = self.sql_result_tab_container.read(cx).is_executing(cx);
@@ -4605,6 +4619,7 @@ impl SqlEditorTab {
                         color: cx.theme().danger,
                         tooltip: t!("Query.stop").into(),
                         disabled: false,
+                        loading: false,
                     },
                     cx.listener(Self::handle_stop_query),
                     cx,
@@ -4616,6 +4631,7 @@ impl SqlEditorTab {
                         color: cx.theme().success,
                         tooltip: t!("Query.run_selected").into(),
                         disabled: transaction_finishing,
+                        loading: false,
                     },
                     cx.listener(Self::handle_run_query),
                     cx,
@@ -4627,6 +4643,7 @@ impl SqlEditorTab {
                         color: cx.theme().success,
                         tooltip: t!("Query.run").into(),
                         disabled: transaction_finishing,
+                        loading: false,
                     },
                     cx.listener(Self::handle_run_query),
                     cx,
@@ -4639,6 +4656,7 @@ impl SqlEditorTab {
                     color: cx.theme().info,
                     tooltip: t!("Query.explain").into(),
                     disabled: is_query_executing || transaction_finishing,
+                    loading: false,
                 },
                 cx.listener(Self::handle_explain_sql),
                 cx,
@@ -4650,6 +4668,7 @@ impl SqlEditorTab {
                     color: cx.theme().warning,
                     tooltip: t!("Query.format").into(),
                     disabled: false,
+                    loading: false,
                 },
                 cx.listener(Self::handle_format_query),
                 cx,
@@ -4661,6 +4680,7 @@ impl SqlEditorTab {
                     color: cx.theme().primary,
                     tooltip: t!("Query.save").into(),
                     disabled: false,
+                    loading: false,
                 },
                 cx.listener(Self::handle_save_query),
                 cx,
@@ -4687,6 +4707,10 @@ impl SqlEditorTab {
                                     color: cx.theme().success,
                                     tooltip: t!("Query.transaction_commit").into(),
                                     disabled: transaction_unavailable,
+                                    loading: transaction_action_loading(
+                                        finishing_action,
+                                        ManualTransactionAction::Commit,
+                                    ),
                                 },
                                 cx.listener(Self::handle_commit_transaction),
                                 cx,
@@ -4698,6 +4722,10 @@ impl SqlEditorTab {
                                     color: cx.theme().danger,
                                     tooltip: t!("Query.transaction_rollback").into(),
                                     disabled: transaction_unavailable,
+                                    loading: transaction_action_loading(
+                                        finishing_action,
+                                        ManualTransactionAction::Rollback,
+                                    ),
                                 },
                                 cx.listener(Self::handle_rollback_transaction),
                                 cx,
@@ -4773,6 +4801,7 @@ impl SqlEditorTab {
             .disabled(spec.disabled)
             .tooltip(spec.tooltip)
             .icon(spec.icon)
+            .loading(spec.loading)
             .on_click(on_click)
     }
 }
@@ -5083,8 +5112,8 @@ mod tests {
         query_toolbar_action, schema_changed_event_matches_scope, should_render_schema_select,
         sql_text_for_run_all, sql_text_for_toolbar_run, statement_for_gutter_marker,
         statement_marker_id, supports_manual_transactions, toggle_line_comment_defaults,
-        toggle_sql_line_comments, transaction_liveness, unquote_sql_identifier,
-        viewport_statement_scan_input, write_new_sql_file, write_sql_file,
+        toggle_sql_line_comments, transaction_action_loading, transaction_liveness,
+        unquote_sql_identifier, viewport_statement_scan_input, write_new_sql_file, write_sql_file,
     };
     use crate::sql_editor::SqlEditor;
     use db::DbManager;
@@ -6513,6 +6542,71 @@ mod tests {
             query_toolbar_action(false, true)
         );
         assert_eq!(QueryToolbarAction::Run, query_toolbar_action(false, false));
+    }
+
+    #[test]
+    fn transaction_button_loading_follows_the_finishing_action() {
+        // 没在收尾时没有按钮转圈。
+        assert!(!transaction_action_loading(
+            None,
+            ManualTransactionAction::Commit
+        ));
+        assert!(!transaction_action_loading(
+            None,
+            ManualTransactionAction::Rollback
+        ));
+        // 只有正在执行的那个动作转圈，另一个保持普通图标（已被禁用）。
+        assert!(transaction_action_loading(
+            Some(ManualTransactionAction::Commit),
+            ManualTransactionAction::Commit
+        ));
+        assert!(!transaction_action_loading(
+            Some(ManualTransactionAction::Commit),
+            ManualTransactionAction::Rollback
+        ));
+        assert!(transaction_action_loading(
+            Some(ManualTransactionAction::Rollback),
+            ManualTransactionAction::Rollback
+        ));
+    }
+
+    #[test]
+    fn manual_transaction_button_loading_is_wired_to_its_own_action() {
+        let source = include_str!("sql_editor_view.rs");
+        let toolbar = source
+            .split("let finishing_action = self.manual_transaction_finishing;")
+            .nth(1)
+            .unwrap()
+            .split("fn query_toolbar_button")
+            .next()
+            .unwrap();
+
+        assert_eq!(
+            2,
+            toolbar
+                .matches("loading: transaction_action_loading(")
+                .count(),
+            "提交与回滚两个按钮都要按各自的动作决定 loading"
+        );
+        assert!(toolbar.contains("ManualTransactionAction::Commit,"));
+        assert!(toolbar.contains("ManualTransactionAction::Rollback,"));
+    }
+
+    #[test]
+    fn query_toolbar_button_spec_loading_reaches_the_button() {
+        let source = include_str!("sql_editor_view.rs");
+        let builder = source
+            .split("fn query_toolbar_button(")
+            .nth(1)
+            .unwrap()
+            .split("fn metadata_scope_selection")
+            .next()
+            .unwrap();
+
+        assert!(
+            builder.contains(".loading(spec.loading)"),
+            "QueryToolbarButtonSpec::loading 必须真的传到 Button，否则按钮只会被禁用、不转圈"
+        );
     }
 
     #[test]

@@ -3183,6 +3183,7 @@ impl DataGrid {
                             let summary = t!("TableDataGrid.get_table_keys_failed", error = error)
                                 .to_string();
                             notification(cx, summary);
+                            this.set_saving(false, cx);
                         });
                         return;
                     }
@@ -3217,6 +3218,7 @@ impl DataGrid {
                 Err(msg) => {
                     cx.update(|cx| {
                         notification(cx, msg);
+                        this.set_saving(false, cx);
                     });
                     return;
                 }
@@ -3277,11 +3279,27 @@ impl DataGrid {
         .detach();
     }
 
+    /// 更新「保存中」状态。
+    ///
+    /// 状态放在表格 delegate 上：`DataGrid` 已 observe 表格实体，delegate 变更
+    /// 会自动让工具栏重画；提交路径持有的 `DataGrid` clone 与主实体共享同一个
+    /// 表格 Entity，所以异步回调里也能写。
+    fn set_saving(&self, saving: bool, cx: &mut App) {
+        self.table.update(cx, |state, cx| {
+            if state.delegate().is_saving() == saving {
+                return;
+            }
+            state.delegate_mut().set_saving(saving);
+            cx.notify();
+        });
+    }
+
     fn handle_save_changes(&self, _: &ClickEvent, _window: &mut Window, cx: &mut App) {
         let changes = self.get_changes(cx);
         if changes.is_empty() {
             return;
         }
+        self.set_saving(true, cx);
 
         let global_state = cx.global::<GlobalDbState>().clone();
         let connection_id = self.config.connection_id.clone();
@@ -3316,6 +3334,7 @@ impl DataGrid {
                             let summary = t!("TableDataGrid.get_table_keys_failed", error = error)
                                 .to_string();
                             notification(cx, summary);
+                            this.set_saving(false, cx);
                         });
                         return;
                     }
@@ -3350,6 +3369,7 @@ impl DataGrid {
                 Err(msg) => {
                     cx.update(|cx| {
                         notification(cx, msg);
+                        this.set_saving(false, cx);
                     });
                     return;
                 }
@@ -3373,33 +3393,36 @@ impl DataGrid {
                 )
                 .await;
 
-            cx.update(|cx| match result {
-                Ok(results) => {
-                    let sql = sql_content.clone();
-                    let first_error = first_execution_error(&results).map(str::to_owned);
-                    let succeeded = first_error.is_none();
-                    this.record_execution_results(sql, &results, cx);
-                    let summary = first_error
-                        .map(|error| {
-                            t!("TableDataGrid.save_changes_failed", error = error).to_string()
-                        })
-                        .unwrap_or_else(|| {
-                            t!("TableDataGrid.save_changes_success", count = change_count)
-                                .to_string()
-                        });
+            cx.update(|cx| {
+                match result {
+                    Ok(results) => {
+                        let sql = sql_content.clone();
+                        let first_error = first_execution_error(&results).map(str::to_owned);
+                        let succeeded = first_error.is_none();
+                        this.record_execution_results(sql, &results, cx);
+                        let summary = first_error
+                            .map(|error| {
+                                t!("TableDataGrid.save_changes_failed", error = error).to_string()
+                            })
+                            .unwrap_or_else(|| {
+                                t!("TableDataGrid.save_changes_success", count = change_count)
+                                    .to_string()
+                            });
 
-                    if succeeded {
-                        this.clear_changes_and_refresh(cx);
+                        if succeeded {
+                            this.clear_changes_and_refresh(cx);
+                        }
+                        notification(cx, summary);
                     }
-                    notification(cx, summary);
+                    Err(error) => {
+                        let error = error.to_string();
+                        let summary =
+                            t!("TableDataGrid.save_changes_failed", error = error).to_string();
+                        this.record_execution_failure(error, Some(sql_content), cx);
+                        notification(cx, summary);
+                    }
                 }
-                Err(error) => {
-                    let error = error.to_string();
-                    let summary =
-                        t!("TableDataGrid.save_changes_failed", error = error).to_string();
-                    this.record_execution_failure(error, Some(sql_content), cx);
-                    notification(cx, summary);
-                }
+                this.set_saving(false, cx);
             });
         })
         .detach();
@@ -4010,6 +4033,7 @@ impl DataGrid {
     pub fn render_toolbar(&self, _window: &mut Window, cx: &Context<Self>) -> AnyElement {
         let editable = self.config.editable;
         let loading = self.table.read(cx).delegate().is_loading();
+        let saving = self.table.read(cx).delegate().is_saving();
         let data_grid = cx.entity().clone();
         // 纵向「列：值」形态没有「行 × 列」的二维落点：行增删、表内查找、
         // 大文本编辑器收起。但单元格编辑本身在纵向视图里是有落点的（一条
@@ -4086,6 +4110,7 @@ impl DataGrid {
                         .icon(IconName::ArrowUp)
                         .tooltip(t!("TableDataGrid.commit_changes").to_string())
                         .disabled(loading)
+                        .loading(saving)
                         .on_click(cx.listener(Self::handle_commit_changes)),
                 )
             })
