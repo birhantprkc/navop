@@ -154,6 +154,14 @@ impl CredentialForm {
         build_entry(self.existing.clone(), self.values(cx))
     }
 
+    /// 保存已经落地：把表单切到「已保存」状态（记住刚保存的条目，含 id）。
+    ///
+    /// 下一轮保存会按已有条目走更新而不是新建 —— 窗口因为隐藏失败留在屏幕上时
+    /// （关闭漏斗返回 `Retained`）用户可能再点一次「保存」。
+    pub(crate) fn mark_saved(&mut self, entry: CredentialEntry) {
+        self.existing = Some(entry);
+    }
+
     fn values(&self, cx: &App) -> CredentialFormValues {
         CredentialFormValues {
             name: input_value(&self.name_input, cx),

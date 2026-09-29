@@ -867,15 +867,27 @@ mod reuse_contract_tests {
 
         let destroys = close.matches("window.remove_window();").count();
         assert_eq!(
-            destroys, 2,
-            "destroying is only allowed for a non-popup window and a refused hide \
-             (`Ok(false)`, i.e. a build that did not opt in); neither a successful hide nor a \
-             failed one may destroy the window, otherwise the Touch Bar finder can retract an \
-             observation of a dead object again"
+            destroys, 1,
+            "destroying is only allowed when the window is not a popup (`Ok(false)`, i.e. a build \
+             that did not opt in); neither a successful hide nor a failed one may destroy the \
+             window, otherwise the Touch Bar finder can retract an observation of a dead object again"
+        );
+
+        // 决策本身抽成了纯函数，「隐藏失败必须保留窗口」才能在没有真窗口的情况下回归。
+        let plan = body(CLOSE_SOURCE, "fn close_plan(is_popup: bool");
+        assert!(
+            plan.contains("Err(_) => ClosePlan::Retain"),
+            "a failed hide must keep the window (`Retain`) instead of silently degrading to a \
+             destroy"
+        );
+        assert!(
+            !plan.contains("remove_window"),
+            "close_plan is the pure decision only: destroying belongs to the funnel, so that a \
+             regression cannot hide behind `Ok(false)`"
         );
 
         let failure = close
-            .split("Err(error)")
+            .split("ClosePlan::Retain")
             .nth(1)
             .expect("the funnel must still handle a failed hide explicitly");
         assert!(
@@ -887,6 +899,19 @@ mod reuse_contract_tests {
             !failure.contains("remove_window"),
             "a failed hide must keep the window and its session: destroying it here is exactly \
              the AppKit close path this switch exists to avoid"
+        );
+
+        // 保存类流程的收尾：窗口没关掉时必须告诉用户，而不是让表单静默留在屏幕上（留在屏幕上
+        // 的表单还能再点一次「保存」，那正是「已保存但没关掉」以外最容易漏的一条）。
+        let after_save = body(CLOSE_SOURCE, "pub fn close_window_after_save");
+        assert!(
+            after_save.contains("WindowCloseOutcome::Retained"),
+            "close_window_after_save must branch on `Retained`: that is the only case where the \
+             form stays on screen and the user has to be told the save landed but the window did not"
+        );
+        assert!(
+            after_save.contains("push_notification"),
+            "close_window_after_save must tell the user when the window could not be closed"
         );
     }
 
