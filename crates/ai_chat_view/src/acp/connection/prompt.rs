@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 use agent_client_protocol::schema::{CancelNotification, ContentBlock, PromptRequest, TextContent};
 use agent_runtime::{RuntimeEvent, TurnId};
@@ -60,7 +61,24 @@ impl AcpConnection {
         let expected_turn_id = turn_id.clone();
         self.handle.spawn(async move {
             let future = connection.send_request(request).block_task();
-            let result = tokio::time::timeout(timeout, future).await;
+            // The request future must survive the timeout: dropping it tears
+            // down the JSON-RPC response router's receiver, so the agent's
+            // reply to the cancelled request surfaces as a connection-fatal
+            // "failed to send response, receiver dropped" error. Keep polling
+            // it until the cancel handshake resolves (or a grace period
+            // expires for agents that never answer).
+            tokio::pin!(future);
+            let cancel_grace = timeout.max(Duration::from_secs(30));
+            let result = match tokio::time::timeout(timeout, future.as_mut()).await {
+                Ok(result) => Some(result),
+                Err(_elapsed) => {
+                    let _ = connection.send_notification(CancelNotification::new(
+                        acp_session_id.clone(),
+                    ));
+                    let _ = tokio::time::timeout(cancel_grace, future.as_mut()).await;
+                    None
+                }
+            };
             finish_prompt(
                 PromptContext {
                     connection,
@@ -164,9 +182,11 @@ struct PromptContext {
 
 async fn finish_prompt(
     context: PromptContext,
-    result: Result<
-        Result<agent_client_protocol::schema::PromptResponse, agent_client_protocol::Error>,
-        tokio::time::error::Elapsed,
+    result: Option<
+        Result<
+            agent_client_protocol::schema::PromptResponse,
+            agent_client_protocol::Error,
+        >,
     >,
 ) {
     let closed_error = connection_closed_error(&context.agent_id, &context.agent_name, None);
@@ -188,9 +208,9 @@ async fn finish_prompt(
     };
     let turn_id = tracker.turn_id().clone();
     match result {
-        Ok(Ok(response)) => emit_success(&context, turn_id, tracker, response.stop_reason),
-        Ok(Err(error)) => emit_protocol_error(&context, turn_id, error),
-        Err(_) => emit_timeout(&context, turn_id).await,
+        Some(Ok(response)) => emit_success(&context, turn_id, tracker, response.stop_reason),
+        Some(Err(error)) => emit_protocol_error(&context, turn_id, error),
+        None => emit_timeout(&context, turn_id),
     }
 }
 
@@ -242,10 +262,9 @@ fn emit_protocol_error(
     emit_failed(context, turn_id, error);
 }
 
-async fn emit_timeout(context: &PromptContext, turn_id: TurnId) {
-    let _ = context
-        .connection
-        .send_notification(CancelNotification::new(context.acp_session_id.clone()));
+fn emit_timeout(context: &PromptContext, turn_id: TurnId) {
+    // The cancel notification was already sent by the timeout branch in
+    // `try_prompt`; this only publishes the failure.
     let error = AcpError::new(
         AcpErrorKind::PromptTimeout,
         &context.agent_id,
@@ -253,7 +272,7 @@ async fn emit_timeout(context: &PromptContext, turn_id: TurnId) {
         t!("AgentUi.acp_prompt_timeout").to_string(),
     )
     .with_recovery(AcpRecoveryAction::Retry);
-    emit_failed(context, turn_id, error);
+    emit_failed(context, turn_id, error)
 }
 
 fn emit_failed(context: &PromptContext, turn_id: TurnId, error: AcpError) {
