@@ -165,4 +165,19 @@ fn native_hide_is_macos_only_and_keeps_the_window_registered() {
     let reset = method_source(source, "fn reset_for_reuse(");
     assert!(!reset.contains("self.next_tab_id ="));
     assert!(reset.contains("self.tabs.clear()"));
+
+    let failed = prepare
+        .split("Err(error) =>")
+        .nth(1)
+        .expect("prepare_window_close must handle a failed hide explicitly");
+    assert!(
+        !failed.contains("window.remove_window()"),
+        "a failed hide must keep the editor window alive: removal is the AppKit close path \
+         this switch exists to avoid"
+    );
+    assert!(
+        !failed.contains("clear_editor_window"),
+        "a failed hide must leave the editor window registered, so the next open reuses it \
+         instead of orphaning the live one"
+    );
 }

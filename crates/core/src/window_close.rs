@@ -93,10 +93,12 @@ pub fn request_close_window(window_handle: AnyWindowHandle, cx: &mut App) {
     });
 }
 
-/// 这个构建是否启用「关闭即隐藏」兜底（Intel macOS 发布包）。
+/// 这个构建是否启用「关闭即隐藏」兜底（开着 `macos-touchbar-window-hide` 的 macOS 构建）。
 ///
-/// 只有 `x86_64-apple-darwin` 的发布包会在打包时打开 `macos-touchbar-window-hide`
+/// 当前只有 `x86_64-apple-darwin` 的发布包会在打包时打开这个 feature
 /// （见 `crates/core/Cargo.toml` 的 feature 说明与 `docs/macos-memory-investigation.md` §10）。
+/// 判据里**没有架构条件**：Touch Bar 也存在于 Apple Silicon 的 13 英寸 MacBook Pro
+/// （M1 2020 / M2 2022）上，那一侧需要同样保护时，给它的构建传同一个 feature 即可。
 /// 未启用时所有隐藏路径都必须退回原来的「关闭即销毁」，行为与加这套机制之前一致。
 ///
 /// 开关刻意收敛成**一个常量**而不是散落的 `#[cfg]`：弹窗（[`crate::popup_window`]）、
@@ -126,7 +128,10 @@ pub const HIDE_WINDOWS_ON_CLOSE: bool = cfg!(all(
 /// - `Ok(true)`：已隐藏。调用方**不要**再 `remove_window()`。
 /// - `Ok(false)`：当前构建不走这套（非 macOS，或没开 `macos-touchbar-window-hide`），
 ///   调用方照旧销毁。
-/// - `Err`：隐藏失败。调用方同样应照旧销毁。
+/// - `Err`：隐藏失败。**只有开了 `macos-touchbar-window-hide` 的构建才可能走到这里**
+///   （未启用时函数在第一步就返回 `Ok(false)`），所以调用方**不要**退回销毁 —— 那正是
+///   要规避的那条路径。受保护模式下的约定是「保留窗口、记录错误」，见
+///   [`close_window_for_reuse`]。
 ///
 /// 与 `remote_file_editor::editor_window_visibility::hide_for_reuse` 同构 —— 那份是
 /// issue #262 的原始修法，已经上真机验证有效。两者将来应收敛成一份。
@@ -165,16 +170,36 @@ pub fn hide_for_reuse(_window: &Window) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-/// 关闭一个弹窗：macOS 上隐藏原生窗口（**不销毁**）并结束业务会话；其他平台或隐藏失败时
-/// 退回销毁。
+/// 关闭动作的三种结果。
 ///
-/// 返回 `true` 表示窗口只是被隐藏、**仍然存活**。
+/// 「隐藏失败就退回销毁」曾经是故意的下坡路，但它和这套机制的目的事实相冲突：**受保护
+/// 模式下的销毁同样会经过 AppKit 的关闭流程**，也就是要规避的那条路径。所以三种结果分开，
+/// 由调用方（与日志）看得见差别，而不是悄悄降级成销毁。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowCloseOutcome {
+    /// 原生窗口已隐藏、业务会话已结束。窗口仍然存活，同一个复用键可以重新显示它。
+    Hidden,
+    /// 窗口已销毁：要么它不是弹窗（主窗口、编辑器窗口这类不经过弹窗登记表的窗口），
+    /// 要么当前构建没有打开 [`HIDE_WINDOWS_ON_CLOSE`]。
+    Destroyed,
+    /// **受保护模式下隐藏失败**：窗口和它的业务会话都保持原样，这次关闭没有生效。
+    /// 调用方可以重试或提示用户；**不要**退回 `remove_window()`。
+    Retained,
+}
+
+/// 关闭一个弹窗：macOS 上隐藏原生窗口（**不销毁**）并结束业务会话；不是弹窗、或当前构建
+/// 没开保护时照旧销毁。
+///
+/// 返回值是 [`WindowCloseOutcome`]：调用方据此知道窗口是「隐藏复用」还是「已销毁」；
+/// 受保护模式下隐藏失败时还会拿到 [`WindowCloseOutcome::Retained`]，表示**这次关闭没有
+/// 生效**（窗口和它的业务会话都保持原样，调用方可以重试或提示用户）。
 ///
 /// # 生效范围
 ///
 /// 整套「隐藏不销毁」只在 [`HIDE_WINDOWS_ON_CLOSE`] 为真时生效，也就是打包时开了
-/// `macos-touchbar-window-hide` 的 x86_64 macOS 包。未启用时这个函数对弹窗的结果与普通
-/// 窗口一样：`remove_window()`，即加这套机制之前的行为。
+/// `macos-touchbar-window-hide` 的 macOS 构建（当前发布流水线只给 `x86_64-apple-darwin`
+/// 打开）。未启用时这个函数对弹窗的结果与普通窗口一样：`remove_window()`，即加这套机制
+/// 之前的行为。
 ///
 /// # 弹窗一律不销毁
 ///
@@ -204,27 +229,35 @@ pub fn hide_for_reuse(_window: &Window) -> anyhow::Result<bool> {
 /// 这也是不把它交给 `defer` 的原因。
 ///
 /// 参数里有 `cx` 就是因为第 2 步必须能更新内容实体；只有 `&mut Window` 的接口做不到。
-pub fn close_window_for_reuse(window: &mut Window, cx: &mut App) -> bool {
+pub fn close_window_for_reuse(window: &mut Window, cx: &mut App) -> WindowCloseOutcome {
     // 不是弹窗：照旧销毁。它不在这条复用链上，也没有「AppKit 在关闭流程里销毁弹窗」
     // 那个崩溃点；顺手也把视图层「改错了本该销毁的窗口」变成隐藏的风险挡住。
     if !crate::popup_window::is_popup_window(window.window_handle().window_id()) {
         window.remove_window();
-        return false;
+        return WindowCloseOutcome::Destroyed;
     }
 
     match hide_for_reuse(window) {
         Ok(true) => {
             crate::popup_window::end_popup_session(window, cx);
-            true
+            WindowCloseOutcome::Hidden
         }
         Ok(false) => {
             window.remove_window();
-            false
+            WindowCloseOutcome::Destroyed
         }
         Err(error) => {
-            tracing::warn!(?error, "failed to hide the window; falling back to removal");
-            window.remove_window();
-            false
+            // `Err` 只可能来自开了 `macos-touchbar-window-hide` 的构建：未启用时
+            // `hide_for_reuse` 在第一步就返回 `Ok(false)`（契约测试
+            // `the_hide_switch_gates_every_link_of_the_chain` 钉住这个顺序）。
+            //
+            // 不销毁：受保护模式下的销毁同样要经过 AppKit 的关闭流程，正是要规避的那条
+            // 路径。窗口与它的业务会话保持原样，调用方从 `Retained` 知道这次关闭没生效。
+            tracing::error!(
+                ?error,
+                "failed to hide the window; keeping it alive instead of destroying it"
+            );
+            WindowCloseOutcome::Retained
         }
     }
 }
@@ -351,7 +384,7 @@ mod tests {
             assert!(
                 !source.contains("window.remove_window()"),
                 "{path} 里还有直接销毁窗口的写法：这类窗口必须走 one_core::window_close::close_window_for_reuse，\
-                 否则 Intel Mac（Touch Bar）上关闭时会闪退"
+                 否则带 Touch Bar 的 Mac 上关闭时会闪退"
             );
         }
     }

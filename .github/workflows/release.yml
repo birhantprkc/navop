@@ -329,9 +329,13 @@ jobs:
           echo "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}"
           echo "CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO:-}"
           echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-}"
-          # `macos-touchbar-window-hide` 只为 Intel Mac 打开：Touch Bar 只存在于 x86_64 机型，
-          # 而「关闭即隐藏」有明确的代价 —— 隐藏的原生窗口会一直占着 NSWindow / CAMetalLayer
-          # 直到进程退出（见 main/Cargo.toml 与 crates/core/Cargo.toml 的 feature 注释）。
+          # `macos-touchbar-window-hide` 当前只为 x86_64-apple-darwin 打开：已复现的闪退现场
+          # 都在 Intel Touch Bar 机型上，而「关闭即隐藏」有明确的代价 —— 隐藏的原生窗口会一直
+          # 占着 NSWindow / CAMetalLayer 直到进程退出（见 main/Cargo.toml 与 crates/core/Cargo.toml
+          # 的 feature 注释）。
+          # 这不是「ARM 没有 Touch Bar」：Apple Silicon 的 13 英寸 MacBook Pro（M1 2020 /
+          # M2 2022）同样带 Touch Bar。判据里没有架构条件，那一侧需要复现或验证时，把下面这个
+          # 判定条件加上 `aarch64-apple-darwin` 即可。
           # ARM macOS / Windows / Linux 交付的是加这套机制之前的形态：关闭即销毁。
           #
           # 用普通变量而不是 bash 数组：macOS runner 的系统 bash 是 3.2，`set -u` 下展开空数组

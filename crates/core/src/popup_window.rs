@@ -87,7 +87,9 @@ fn record_reusable_popup(
             .is_none();
         drop(slots);
         if is_new_window {
-            crate::popup_lifecycle::record_window_registered();
+            crate::popup_lifecycle::record_window_registered(
+                crate::popup_lifecycle::PopupWindowKind::Reusable,
+            );
             crate::popup_lifecycle::log_lifecycle("popup_window_registered");
         }
     }
@@ -100,7 +102,9 @@ fn forget_reusable_popup(key: &str) {
         let removed = slots.remove(key).is_some();
         drop(slots);
         if removed {
-            crate::popup_lifecycle::record_window_unregistered();
+            crate::popup_lifecycle::record_window_unregistered(
+                crate::popup_lifecycle::PopupWindowKind::Reusable,
+            );
             crate::popup_lifecycle::log_lifecycle("popup_window_unregistered");
         }
     }
@@ -112,7 +116,9 @@ fn record_parked_popup(window_id: WindowId, content: WeakEntity<PopupWindowConte
         let is_new_window = slots.insert(window_id, content).is_none();
         drop(slots);
         if is_new_window {
-            crate::popup_lifecycle::record_window_registered();
+            crate::popup_lifecycle::record_window_registered(
+                crate::popup_lifecycle::PopupWindowKind::Parked,
+            );
             crate::popup_lifecycle::log_lifecycle("popup_window_registered");
         }
     }
@@ -123,7 +129,9 @@ fn forget_parked_popup(window_id: WindowId) {
         let removed = slots.remove(&window_id).is_some();
         drop(slots);
         if removed {
-            crate::popup_lifecycle::record_window_unregistered();
+            crate::popup_lifecycle::record_window_unregistered(
+                crate::popup_lifecycle::PopupWindowKind::Parked,
+            );
             crate::popup_lifecycle::log_lifecycle("popup_window_unregistered");
         }
     }
@@ -411,7 +419,8 @@ impl PopupWindowOptions {
 ///
 /// # 关闭行为
 ///
-/// 开了 `macos-touchbar-window-hide`（x86_64 macOS 发布包）的构建里，这个窗口关闭时
+/// 开了 `macos-touchbar-window-hide`（当前发布流水线只给 x86_64 macOS 打开）的构建里，
+/// 这个窗口关闭时
 /// **只隐藏、不销毁**（见 [`crate::window_close::close_window_for_reuse`]）：它是 macOS
 /// Touch Bar 机型闪退（navop#308 / navop#314）的修法。没有复用键，所以关闭后不会有人
 /// 重新显示它，下一次打开是新建一个窗口 —— 代价与后续收敛方向见 [`PARKED_POPUPS`]。
@@ -831,11 +840,15 @@ mod reuse_contract_tests {
         &rest[..end]
     }
 
-    /// **弹窗只隐藏、不销毁**；销毁只剩「不是弹窗」和「隐藏失败」两条兜底。
+    /// **弹窗只隐藏、不销毁**；销毁只剩「不是弹窗」和「当前构建没开保护」两条路。
     ///
     /// 0.3.118 的现场把不变量抬到了这一步：只要窗口是在**某条路线**上被销毁的，那条路线
     /// 就会被 AppKit 的延迟注销踩到（#308 「确定」、#314 「保存」、以及红点）。所以成功
     /// 隐藏的分支里绝不能出现销毁动作 —— 否则修了三条路、还会漏第四条。
+    ///
+    /// 「隐藏失败」曾经是第三条销毁路线（`warn!` + `remove_window()`），现在不是了：受保护
+    /// 模式下的销毁同样会经过 AppKit 的关闭流程，把「关不掉」降级成「偷偷销毁」等于把崩溃
+    /// 挪回原位。失败要**保留窗口**、记 error 日志，并把 `Retained` 交回调用方。
     #[test]
     fn popup_windows_are_hidden_and_never_destroyed() {
         let close = body(CLOSE_SOURCE, "pub fn close_window_for_reuse");
@@ -854,10 +867,26 @@ mod reuse_contract_tests {
 
         let destroys = close.matches("window.remove_window();").count();
         assert_eq!(
-            destroys, 3,
-            "destroying is only allowed for a non-popup window, a refused hide (`Ok(false)`) \
-             and a failed hide (`Err`); a successful hide must never destroy the window, \
-             otherwise the Touch Bar finder can retract an observation of a dead object again"
+            destroys, 2,
+            "destroying is only allowed for a non-popup window and a refused hide \
+             (`Ok(false)`, i.e. a build that did not opt in); neither a successful hide nor a \
+             failed one may destroy the window, otherwise the Touch Bar finder can retract an \
+             observation of a dead object again"
+        );
+
+        let failure = close
+            .split("Err(error)")
+            .nth(1)
+            .expect("the funnel must still handle a failed hide explicitly");
+        assert!(
+            failure.contains("WindowCloseOutcome::Retained"),
+            "a failed hide must report `Retained` to the caller instead of silently degrading \
+             to a destroy"
+        );
+        assert!(
+            !failure.contains("remove_window"),
+            "a failed hide must keep the window and its session: destroying it here is exactly \
+             the AppKit close path this switch exists to avoid"
         );
     }
 
@@ -904,7 +933,8 @@ mod reuse_contract_tests {
         assert!(
             hide < end,
             "the session must only end after the window was actually hidden: a failed hide \
-             destroys the window, and its content entity returns the count on drop"
+             keeps the window and its session (nothing is destroyed, so no `Drop` returns the \
+             count)"
         );
 
         let content = body(POPUP_SOURCE, "struct PopupWindowContent");
@@ -1005,8 +1035,9 @@ mod reuse_contract_tests {
 
     /// **开关只有一个来源**，而且它把整条链路上的每一环都门控了。
     ///
-    /// 这套机制只在 x86_64 macOS 包里启用（见 `crates/core/Cargo.toml` 的
-    /// `macos-touchbar-window-hide`），其他构建必须逐字退回原行为。漏掉任何一环都会变成
+    /// 这套机制只在打包时开了 `macos-touchbar-window-hide` 的 macOS 包里启用（见
+    /// `crates/core/Cargo.toml` 的 `macos-touchbar-window-hide`；当前发布流水线只给
+    /// `x86_64-apple-darwin` 打开），其他构建必须逐字退回原行为。漏掉任何一环都会变成
     /// 半开半关的状态，而且都不报错、只静默退化：
     /// 登记了却不隐藏（窗口照样销毁，条目永远探活失败，白占内存）、隐藏了却不登记
     /// （窗口藏起来但业务 view 不卸载，纯泄漏）、装了关闭路线却不隐藏（点红点没反应）。
@@ -1022,15 +1053,24 @@ mod reuse_contract_tests {
                 "pubconstHIDE_WINDOWS_ON_CLOSE:bool=cfg!(all(target_os=\"macos\",feature=\"macos-touchbar-window-hide\"));"
             ),
             "the switch must stay derived from `target_os = \"macos\"` **and** the cargo \
-             feature: Touch Bar only exists on Intel Macs, and a build that forgets the target \
-             check would turn the workaround on for every platform"
+             feature: a build that forgets the target check would turn the workaround on for \
+             Windows and Linux too (the feature itself carries no architecture condition — \
+             Apple Silicon Touch Bar Macs need the same protection on demand)"
         );
 
         let hide = body(CLOSE_SOURCE, "pub fn hide_for_reuse");
-        assert!(
-            hide.contains("if !HIDE_WINDOWS_ON_CLOSE"),
+        let opt_in_guard = hide.find("if !HIDE_WINDOWS_ON_CLOSE").expect(
             "hide_for_reuse must refuse to hide in builds that do not opt in, so that the \
-             single close funnel degrades to `remove_window()` as before"
+                 single close funnel degrades to `remove_window()` as before",
+        );
+        let first_step_that_can_fail = hide
+            .find("MainThreadMarker::new()")
+            .expect("hide_for_reuse must check that it runs on AppKit's main thread");
+        assert!(
+            opt_in_guard < first_step_that_can_fail,
+            "the opt-in guard must come *before* every step that can fail: that ordering is \
+             what makes `Err` reachable only in builds that opted in, and the close funnel \
+             keeps the window on `Err` instead of destroying it"
         );
 
         let routes = body(POPUP_SOURCE, "fn install_popup_close_routes");

@@ -24,7 +24,7 @@ fn editable_extension_connection(connection: &StoredConnection) -> Option<Stored
 
 /// 连接表单弹窗的复用键。
 ///
-/// 表单窗口关闭时只隐藏、不销毁（Intel Mac Touch Bar 闪退的修法），同一个键再次打开时
+/// 表单窗口关闭时只隐藏、不销毁（带 Touch Bar 的 Mac 上关闭即闪退的修法），同一个键再次打开时
 /// 重新显示同一个原生窗口，所以键要带上「哪一类表单 + 哪一个连接」：「新建」只占一个槽位
 /// （同一时刻只需要一个新建表单），编辑表单按连接 id 各占一个 —— 否则给 B 打开编辑表单
 /// 会把 A 那个（连同 A 里没保存的修改）顶掉。
