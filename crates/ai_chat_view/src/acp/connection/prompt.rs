@@ -81,8 +81,6 @@ impl AcpConnection {
             };
             finish_prompt(
                 PromptContext {
-                    connection,
-                    acp_session_id,
                     events,
                     session_id,
                     active_turn,
@@ -169,8 +167,6 @@ fn responding_status_title(agent_name: &str) -> String {
 }
 
 struct PromptContext {
-    connection: agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
-    acp_session_id: agent_client_protocol::schema::SessionId,
     events: tokio::sync::broadcast::Sender<RuntimeEvent>,
     session_id: agent_runtime::SessionId,
     active_turn: std::sync::Arc<std::sync::Mutex<Option<AcpTurnTracker>>>,
