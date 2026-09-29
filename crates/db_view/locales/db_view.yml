@@ -258,6 +258,14 @@ ConnectionForm:
     en: Leave empty to use the database default
     zh-CN: 留空则使用数据库默认值
     zh-HK: 留空則使用資料庫預設值
+  request_timeout_secs:
+    en: Request Timeout (s)
+    zh-CN: 请求超时（秒）
+    zh-HK: 請求逾時（秒）
+  request_timeout_secs_placeholder:
+    en: "Blank: metadata 30s, queries 30 min; 0 = no limit"
+    zh-CN: "留空：元数据 30 秒、查询 30 分钟；0 = 不限制"
+    zh-HK: "留空：中繼資料 30 秒、查詢 30 分鐘；0 = 不限制"
   schema_filter_mode:
     en: Schema Filter
     zh-CN: Schema 过滤
