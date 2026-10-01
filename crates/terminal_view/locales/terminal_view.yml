@@ -1216,6 +1216,14 @@ TerminalView:
     en: Paste as single line
     zh-CN: 合并为单行粘贴
     zh-HK: 合併為單行貼上
+  paste_open_settings:
+    en: Open Settings
+    zh-CN: 打开设置
+    zh-HK: 開啟設定
+  paste_dont_ask_again:
+    en: Don't Ask Again
+    zh-CN: 不再提示
+    zh-HK: 不再提示
   large_paste_title:
     en: Confirm Large Paste
     zh-CN: 确认大段粘贴
